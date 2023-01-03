@@ -1,0 +1,505 @@
+---
+title: "Nigeria data curation and exploration"
+output:
+  html_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+knitr::knit_hooks$set(
+  margin1 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin2 = function(before, options, envir) {
+    if (before) par(mgp = c(2, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin3 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", mai = rep(.1, 4))
+    else NULL
+  }
+)
+
+knitr::opts_chunk$set(echo       = TRUE,
+                      margin1    = TRUE,
+                      fig.retina = 2,
+                      fig.align  = "center")
+
+l <- "en_US.UTF-8"
+Sys.setenv(LANGAGE = l)
+Sys.setlocale(locale = l)
+Sys.setlocale("LC_MESSAGES", l)
+```
+
+## Links to local data sets
+
+Here we use the following links to local data.
+
+```{r}
+POPULATION_DATA_FOLDER <- file.path("population_data")
+ng0_mortality_path <- file.path(POPULATION_DATA_FOLDER, "WPP2019_MORT_F17_1_ABRIDGED_LIFE_TABLE_BOTH_SEXES.xlsx")
+ng2_fertility_path <- file.path(POPULATION_DATA_FOLDER, "ng2_fertility_data.csv")
+```
+
+Change them accordingly if you want to run the script locally on your computer.
+
+## Preambule
+
+This document prepares the demographic and epidemiological data necessary for subsequent analyses. These scripts need to be correctly run before attempting any simulations or statistical analyses. It uses the following data sets. 
+
++ the geographical polygons from [GADM](https://gadm.org).
++ the population counts by local government area from [WorldPop](https://www.worldpop.org).
++ the age-specific fertility rates (`ng2_fertility_data.csv`) from [WorldPop](https://www.worldpop.org).
++ the life table estimates at the country level (`WPP2019_MORT_F17_1_ABRIDGED_LIFE_TABLE_BOTH_SEXES.xlsx`) from [UN Department of Economic and Social Affairs](https://population.un.org/wpp/Download/Standard/Mortality/). 
+
+The first three data sets provide information by local government area (LGA) (775 in Nigeria). 
+
+### Missing data
+
++ Imego-Afon, Ogun does not have population data due to inconsistencies between the GADM polygons and the WorldPop grids, so it is excluded from the analyses. 
++ 32 local government areas do not have age-specific fertility rates. Fertility data for these local government areas are excluded from the aggregated state-level fertility estimates. 
+
+## Packages
+
+The needed packages:
+
+```{r message = FALSE}
+library(tidyverse)
+library(sf)
+library(magrittr)
+library(readxl)
+library(RColorBrewer)
+library(parallel)
+```
+
+## Spatial polygons from GADM
+
+Downloading the polygons (if necessary) from [GADM](https://gadm.org). Data can also be manually downloaded from this [link](https://hub.worldpop.org/geodata/summary?id=16883). 
+
+```{r}
+SPATIAL_POLYGONS_DATA_FOLDER <- file.path("spatial_polygons")
+if (!file.exists(file.path(SPATIAL_POLYGONS_DATA_FOLDER, "gadm36_NGA_0_sf.rds"))) {
+  download.file("https://geodata.ucdavis.edu/gadm/gadm3.6/Rsf/gadm36_NGA_0_sf.rds", 
+                file.path(SPATIAL_POLYGONS_DATA_FOLDER, "gadm36_NGA_0_sf.rds"))
+}
+if (!file.exists(file.path(SPATIAL_POLYGONS_DATA_FOLDER, "gadm36_NGA_1_sf.rds"))) {
+  download.file("https://geodata.ucdavis.edu/gadm/gadm3.6/Rsf/gadm36_NGA_1_sf.rds", 
+                file.path(SPATIAL_POLYGONS_DATA_FOLDER, "gadm36_NGA_1_sf.rds"))
+}
+if (!file.exists(file.path(SPATIAL_POLYGONS_DATA_FOLDER, "gadm36_NGA_2_sf.rds"))) {
+  download.file("https://geodata.ucdavis.edu/gadm/gadm3.6/Rsf/gadm36_NGA_2_sf.rds", 
+                file.path(SPATIAL_POLYGONS_DATA_FOLDER, "gadm36_NGA_2_sf.rds"))
+}
+```
+
+Loading the polygons:
+
+```{r}
+ng0 <- readRDS(file.path(SPATIAL_POLYGONS_DATA_FOLDER, "gadm36_NGA_0_sf.rds")) %>% # country polygon
+  transmute(country = str_squish(NAME_0))
+
+ng1 <- readRDS(file.path(SPATIAL_POLYGONS_DATA_FOLDER, "gadm36_NGA_1_sf.rds")) %>% # state polygons
+  transmute(state = str_squish(NAME_1))
+
+ng2 <- readRDS(file.path(SPATIAL_POLYGONS_DATA_FOLDER, "gadm36_NGA_2_sf.rds")) %>% # LGA polygons
+  transmute(state = str_squish(NAME_1), 
+            LGA = str_squish(NAME_2))
+```
+
+Simplifying the polygons: 
+
+```{r}
+simplified_ng0 <- st_simplify(st_make_valid(ng0), dTolerance=1000)
+simplified_ng1 <- st_simplify(st_make_valid(ng1), dTolerance=1000)
+simplified_ng2 <- st_simplify(st_make_valid(ng2), dTolerance=1000)
+```
+
+Saving the polygons: 
+
+```{r eval=FALSE}
+saveRDS(simplified_ng0, file.path(SPATIAL_POLYGONS_DATA_FOLDER, "ng0.rds"))
+saveRDS(simplified_ng1, file.path(SPATIAL_POLYGONS_DATA_FOLDER, "ng1.rds"))
+saveRDS(simplified_ng2, file.path(SPATIAL_POLYGONS_DATA_FOLDER, "ng2.rds"))
+```
+
+Reading the polygons: 
+
+```{r}
+ng0 <- readRDS(file.path(SPATIAL_POLYGONS_DATA_FOLDER, "ng0.rds"))
+ng1 <- readRDS(file.path(SPATIAL_POLYGONS_DATA_FOLDER, "ng1.rds"))
+ng2 <- readRDS(file.path(SPATIAL_POLYGONS_DATA_FOLDER, "ng2.rds"))
+```
+
+## WorldPop population data
+
+Downloading the population data from [WorldPop](https://www.worldpop.org):
+
+```{r eval=FALSE}
+get_worldpop_data <- function(gender, agegrp) {
+  link <- paste("https://data.worldpop.org/GIS/AgeSex_structures/Global_2000_2020/2020/NGA/nga", 
+                gender, agegrp, "2020.tif", sep="_")
+  file_name <- paste("nga", gender, agegrp, "2020.tif", sep="_")
+  download.file(link, file.path(POPULATION_DATA_FOLDER, file_name))
+}
+genders <- c("f", "m")
+agegrps <- c("0", "1", as.character(seq(5, 80, 5)))
+input <- expand.grid(gender=genders, agegrp=agegrps) %>% head(1)
+(parallel::mcmapply(get_worldpop_data, as.character(input[["gender"]]), input[["agegrp"]], mc.cores=5))
+```
+
+Here, we compute the population size of each local government area (775) for each combination of gender (`m` or `f`) and age group (`0`, `1-4`, `5-9`,...,`80+`) using the polygons from the GADM dataset to set LGA boundaries and the WorldPop dataset for the population sizes (~1 hr):
+
+```{r eval=FALSE}
+lga_population <- function(agegrp_gender_mat, this_lga, this_state, nga_pop, ng=ng2) {
+  lga_polygon <- filter(ng, state==this_state, LGA==this_lga)
+  lga_pop <- nga_pop %>%
+    st_crop(lga_polygon) %>%
+    st_as_stars() %>%
+    st_as_sf() %>%
+    st_drop_geometry()
+  
+  subset_population <- function(this_agegrp, this_gender) {
+    n <- lga_pop[, grepl(paste(this_gender, this_agegrp, "", sep="_"), names(lga_pop), fixed=TRUE)] %>%
+      sum(na.rm=TRUE)
+    return(n)
+  }
+  df <- apply(agegrp_gender_mat, 1, function(x) subset_population(x["agegrp"], x["gender"])) %>%
+    cbind(agegrp_gender_mat, n=.) %>%
+    cbind(LGA=rep(this_lga, nrow(.)), .) %>%
+    cbind(state=rep(this_state, nrow(.)), .)
+  return(df)
+}
+all_files <- list.files(path=POPULATION_DATA_FOLDER, pattern = "2020.tif")
+ngapop_stars_proxy <- do.call(c, purrr::map(all_files, read_stars))
+agegrp_gender_mat <- expand.grid(gender=c("f", "m"), agegrp=c("0", "1", as.character(seq(5, 80, 5))))
+regions <- select(ng2, state, LGA) %>% st_drop_geometry() %>% unique()
+regions <- regions[regions$LGA != "Imeko-Afon", ] # remove Imeko-Afon
+nga_pop <- apply(regions, 1, function(x) lga_population(agegrp_gender_mat=agegrp_gender_mat, 
+                                                        this_lga=x["LGA"], this_state=x["state"],
+                                                        nga_pop=ngapop_stars_proxy)) %>%
+  do.call(rbind, .)
+rownames(nga_pop) <- NULL
+imeko_agon_ogun <- data.frame(state="Ogun", LGA="Imeko-Afon", gender=c("f", "m"), 
+                              agegrp=rep(as.character(c(0, 1, seq(5, 80, 5))), each=2), n=rep(NA, 36))
+nga_pop %<>% rbind(., imeko_agon_ogun)
+#saveRDS(nga_pop, file.path(POPULATION_DATA_FOLDER, "ng2_pop.rds"))
+```
+
+Reading in population data...
+
+```{r}
+ng2_pop_path <- file.path(POPULATION_DATA_FOLDER, "ng2_pop.rds")
+ng2_pop <- readRDS(ng2_pop_path)
+```
+
+Let's confirm that information on the same states and LGAs are included in both the GADM data and the WorldPop data:
+
+```{r}
+nrow(anti_join(st_drop_geometry(ng2), ng2_pop, by=c("state", "LGA")))==0 &&
+nrow(anti_join(ng2_pop, st_drop_geometry(ng2), by=c("state", "LGA")))==0
+```
+
+### Population Sizes
+
+The distribution of local government area population sizes:
+
+```{r}
+ng2_pop %>%
+  group_by(state, LGA) %>%
+  summarise(total_n=sum(n), .groups="keep") %>% 
+  ggplot(aes(x=total_n)) + 
+  geom_histogram(bins = 50, color = "black", fill = "white", na.rm = TRUE) + 
+  theme_bw() + theme(panel.background = element_blank(), panel.grid = element_blank()) +
+  labs(x="population size", y="number of local government areas")
+```
+
+The distribution of the LGA population sizes where all the bars are of the same area and represent one decile of the data:
+
+```{r}
+cb <- RColorBrewer::brewer.pal(9, "YlOrBr")
+color_generator <- colorRampPalette(cb)
+pal <- color_generator(10)
+
+plot_ng2 <- ng2_pop %>%
+  group_by(state, LGA) %>%
+  summarise(total_n=sum(n, na.rm=TRUE), .groups="keep")
+
+ggplot(plot_ng2, aes(x=total_n)) + 
+  geom_histogram(aes(y=..density..), 
+                 breaks=quantile(plot_ng2$total_n, seq(0, 1, le = 11)), fill=pal, col="black", na.rm=TRUE) + 
+  theme_bw() + theme(panel.background = element_blank(), panel.grid = element_blank()) +
+  labs(x="population size", y="probability density")
+```
+
+```{r}
+quantile(plot_ng2$total_n, seq(0, 1, le = 11))
+```
+
+Let's map the population sizes of the local government areas:
+
+```{r}
+ng2_pop %>%
+  group_by(state, LGA) %>%
+  summarise(total_n=sum(n, na.rm=FALSE), .groups="keep") %>%
+  mutate(col = cut(total_n, quantile(.$total_n, seq(0, 1, le = 11), na.rm=TRUE), labels=FALSE)) %>%
+  mutate(col = ifelse(is.na(col), NA, col*10)) %>%
+  mutate(col = factor(col, levels=c(10*(1:length(pal))))) %>%
+  right_join(ng2, by=c("state", "LGA")) %>% 
+  ggplot() + 
+  geom_sf(aes(geometry=geometry, fill=col)) + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill="quantile (%)", title="LGA population sizes") + 
+  scale_fill_manual(values = pal, na.value="black")
+```
+
+The ten largest local government areas:
+
+```{r}
+ng2_pop %>%
+  group_by(state, LGA) %>%
+  summarise(population=sum(n), .groups="keep") %>%
+  arrange(desc(population)) %>%
+  select(state, LGA, population) %>%
+  head(10)
+```
+
+Let's map the population sizes of the states: 
+
+```{r}
+ng2_pop %>%
+  group_by(state) %>%
+  summarise(n=sum(n, na.rm=TRUE), .groups="keep") %>%
+  right_join(ng1, by="state") %>%
+  ggplot() + 
+  geom_sf(aes(geometry=geometry, fill=n)) + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill="", title="state population sizes") + 
+  scale_fill_gradientn(colours=pal)
+```
+
+The five largest states:
+
+```{r}
+ng2_pop %>%
+  group_by(state) %>%
+  summarise(n=sum(n, na.rm=TRUE), .groups="keep") %>%
+  arrange(desc(n)) %>%
+  head(5)
+```
+
+### Age Structure
+
+Population pyramid for Nigeria: 
+
+```{r}
+plot_df <- ng2_pop %>%
+  mutate(agegrp=floor(as.numeric(as.character(agegrp))/5)*5) %>%
+  group_by(gender, agegrp) %>%
+  summarise(n=sum(n, na.rm=TRUE), .groups="keep") %>%
+  spread(key=gender,value=n) %>%
+  mutate(m=-m) %>%
+  mutate(agegrp=paste(agegrp, agegrp+4, sep="-")) %>%
+  mutate(agegrp=factor(agegrp, paste(seq(0, 80, 5), seq(4, 84, 5), sep="-"))) %>%
+  gather(key="gender", value="population", c("m", "f"))
+
+ggplot(plot_df, aes(x=agegrp, y=population, fill=gender)) + 
+  geom_bar(data = subset(plot_df, gender == "f"), stat = "identity") + 
+  geom_bar(data = subset(plot_df, gender == "m"), stat = "identity") + 
+  scale_y_continuous(breaks = seq(-2*10^7, 2*10^7, 5*10^6), 
+                     labels = paste0(as.character(c(seq(20, 0, -5), seq(5, 20, 5))), "m")) + 
+  coord_flip() + 
+  scale_fill_brewer(palette = "Set1") + 
+  theme_bw()
+```
+
+## LGA fertility data
+
+Let's load the age-specific fertility rate for females of child-bearing age (15-44 years) in each local government area. 
+
+```{r}
+ng2_fertility_data <- read.csv(ng2_fertility_path) %>% 
+  transmute(state=State, LGA=LGA, agegrp=Age_Group, asfr=ASFR) %>%
+  mutate(agegrp=gsub("_", "-", agegrp))
+```
+
+Let's check how many local government areas do not have fertility data. 
+
+```{r}
+missing_lgas <- ng2_pop %>% 
+  anti_join(ng2_fertility_data, by=c("state", "LGA")) %>% 
+  select(state, LGA) %>% 
+  unique()
+nrow(missing_lgas)
+```
+There are 32 local government areas without age-specific fertility data. We will handle this missing data by excluding these LGAs from the calculation of the aggregated state-level age-specific fertility rates. 
+
+Let's add information on the age distribution of the population to the fertility data.
+
+```{r}
+ng2_fertility_data <- ng2_pop %>%
+  mutate(agegrp=floor(as.numeric(as.character(agegrp))/5)*5) %>%
+  group_by(state, LGA, agegrp, gender) %>%
+  summarise(n=sum(n), .groups="keep") %>%
+  mutate(agegrp=paste(agegrp, agegrp+4, sep="-")) %>%
+  spread(key=gender, value=n) %>%
+  mutate(`m/f`=m/f, n=m+f) %>%
+  select(state, LGA, agegrp, n, `m/f`) %>% 
+  as.data.frame() %>% 
+  left_join(ng2_fertility_data, by=c("state", "LGA", "agegrp")) %>% 
+  mutate(asfr=ifelse(is.na(asfr), 0, asfr)) %>% 
+  mutate(asfr=ifelse((state %in% missing_lgas$state) & (LGA %in% missing_lgas$LGA), 
+                     NA, asfr))
+```
+
+### Crude birth rates
+
+Let's compute the crude birth rate in each local government area. 
+
+```{r}
+ng2_cbr_data <- ng2_fertility_data %>%
+  mutate(f=n/(`m/f`+1)) %>%
+  group_by(state, LGA) %>%
+  summarise(cbr=sum(f*asfr)/sum(n)*1000, .groups="keep")
+```
+
+The distribution of the crude birth rates across local government areas:
+
+```{r}
+ng2_cbr_data %>%
+  group_by(state, LGA) %>%
+  as.data.frame() %>%
+  ggplot(aes(x=cbr)) + 
+  geom_histogram(bins = 50, color = "black", fill = "white", na.rm = TRUE) + 
+  theme_bw() + theme(panel.background = element_blank(), panel.grid = element_blank()) +
+  labs(x="crude birth rate", y="number of local government areas")
+```
+
+Let's map the crude birth rates across local government areas:
+
+```{r}
+ng2_cbr_data %>%
+  group_by(state, LGA) %>%
+  right_join(ng2, by=c("state", "LGA")) %>% 
+  ggplot() + 
+  geom_sf(aes(geometry=geometry, fill=cbr)) + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill="", title="crude birth rate") + 
+  scale_fill_gradientn(colours=pal)
+```
+
+Let's compute the crude birth rate in each state. 
+
+```{r}
+ng1_cbr_data <- ng2_fertility_data %>% 
+  mutate(f=n/(1+`m/f`), m=n/(1+1/`m/f`)) %>% 
+  group_by(state, agegrp) %>% 
+  summarise(asfr=sum(asfr*f, na.rm=TRUE)/sum(f, na.rm=TRUE), 
+            f=sum(f, na.rm=TRUE), m=sum(m, na.rm=TRUE), .groups="keep") %>%
+  ungroup() %>% group_by(state) %>%
+  summarise(cbr=sum(asfr*f, na.rm=TRUE)/sum(f+m, na.rm=TRUE)*1000, .groups="keep") %>% 
+  as.data.frame()
+```
+
+Let's also compute the age-specific fertility rate in each state. 
+
+```{r eval=FALSE}
+ng1_fertility_data <- ng2_fertility_data %>% 
+  mutate(f=n/(1+`m/f`), m=n/(1+1/`m/f`)) %>% 
+  group_by(state, agegrp) %>% 
+  summarise(asfr=sum(asfr*f, na.rm=TRUE)/sum(f, na.rm=TRUE), 
+            f=sum(f, na.rm=TRUE), m=sum(m, na.rm=TRUE), .groups="keep") %>% 
+  select(state, agegrp, asfr) %>% 
+  filter(agegrp %in% c("15-19", "20-24", "25-29", "30-34", "35-39", "40-44")) %>% 
+  spread(key="agegrp", value="asfr") %>% 
+  ungroup()
+write_csv(ng1_fertility_data, file=file.path(POPULATION_DATA_FOLDER, "ng1_fertility_data.csv"))
+```
+
+## Mortality data
+
+In this section, we estimate the age-specific natural mortality rate function for Nigeria. We start by using life tables provided by the [UN Department of Economic and Social Affairs](https://population.un.org/wpp/Download/Standard/Mortality/). Let's read in the data and retrieve the most recent mortality data for Nigeria. 
+
+```{r}
+# load the age-specific mortality rate for Nigeria
+ng0_mortality_data <- readxl::read_excel(path=ng0_mortality_path, sheet="ESTIMATES", skip=16) %>%
+  select(`Region, subregion, country or area *`, `Period`, `Age (x)`, `Age interval (n)`, 
+         `Probability of surviving p(x,n)`) %>%
+  setNames(c("region", "period", "age", "age_interval", "surv_prob")) %>% 
+  filter(region=="Nigeria", period=="2015-2020") %>% 
+  head(-1) %>% 
+  transmute(region=as.character(region), age=as.numeric(age), 
+            age_interval=as.numeric(age_interval), surv_prob=as.numeric(surv_prob)) %>% 
+  mutate(cum_surv_prob=cumprod(surv_prob))
+```
+
+Next, let's compute the piece-wise constant age-specific mortality rates. We consider three age groups: $(0, 5)$, $(5, 15)$ and $(15, 80)$. These piece-wise constant age-specific mortality rates will be used to estimate the basic reproductive ratio and the who-acquired-infection-from-whom (WAIFW) matrices in the `R0_estimation.Rmd` analyses. 
+```{r}
+# compute the piecewise age-specific mortality rate function for R0 estimation
+agegrps <- c(5, 15, 80)
+ng0_mortality_rates <- rep(NA, length(agegrps))
+prev_cum_surv_prob <- 1
+prev_agegrp <- 0
+for (ii in agegrps) {
+  agegrp_pos <- which(ng0_mortality_data$age==ii)-1
+  cum_surv_prob <- as.numeric(ng0_mortality_data[agegrp_pos, "cum_surv_prob"])
+  surv_prob <- cum_surv_prob/prev_cum_surv_prob
+  interval <- ii - prev_agegrp
+  mu <- (-1/interval)*log(surv_prob)
+  ng0_mortality_rates[which(agegrps==ii)] <- mu
+  prev_agegrp <- ii
+  prev_cum_surv_prob <- cum_surv_prob
+}
+```
+
+Saving the mortality data for Nigeria. 
+
+```{r eval=FALSE}
+saveRDS(ng0_mortality_data, file=file.path(POPULATION_DATA_FOLDER, "ng0_mortality_data.rds"))
+saveRDS(ng0_mortality_rates, file=file.path(POPULATION_DATA_FOLDER, "ng0_mortality_rates.rds"))
+```
+
+## Aggregation of data at national level
+
+In this section, we aggregate data at the national scale. 
+
+### Population data
+
+```{r}
+ng0_pop <- ng2_pop %>% 
+  mutate(country="Nigeria") %>% 
+  group_by(gender, agegrp) %>% 
+  summarise(n=sum(n, na.rm=TRUE), .groups="keep") %>% 
+  as.data.frame()
+```
+
+### Fertility data
+
+```{r}
+ng0_fertility_data <- ng2_fertility_data %>% 
+  mutate(country="Nigeria", f=n/(`m/f`+1)) %>% 
+  mutate(births=f*asfr) %>% 
+  group_by(country, agegrp) %>% 
+  summarise(n=sum(n, na.rm=TRUE), f=sum(f, na.rm=TRUE), births=sum(births, na.rm=TRUE), .groups="keep") %>% 
+  as.data.frame() %>% 
+  mutate(`m/f`=n/f-1, asfr=births/f) %>% 
+  select(-f, -births)
+```
+
+### Save aggregate data
+
+```{r}
+saveRDS(ng0_fertility_data, file.path(POPULATION_DATA_FOLDER, "ng0_fertility_data.rds"))
+saveRDS(ng0_pop, file.path(POPULATION_DATA_FOLDER, "ng0_pop.rds"))
+```
