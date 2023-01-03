@@ -1,0 +1,1153 @@
+---
+title: "Static Analysis"
+output:
+  html_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+knitr::knit_hooks$set(
+  margin1 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin2 = function(before, options, envir) {
+    if (before) par(mgp = c(2, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin3 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", mai = rep(.1, 4))
+    else NULL
+  }
+)
+
+knitr::opts_chunk$set(echo       = TRUE,
+                      margin1    = TRUE,
+                      fig.retina = 2,
+                      fig.align  = "center")
+
+l <- "en_US.UTF-8"
+Sys.setenv(LANGAGE = l)
+Sys.setlocale(locale = l)
+Sys.setlocale("LC_MESSAGES", l)
+```
+
+## Preamble 
+
+In this document, we perform static risk assessment. In particular, we attempt to answer three broad questions:
+
+1. What is the CRS burden in each state in the absence of any rubella vaccination?
+2. How does the CRS burden in each state change following the introduction of routine rubella vaccination at current MCV1 coverage levels?
+3. What is the minimally-sufficient routine vaccination coverage required to prevent an increase 30-year CRS burden relative to pre-vaccination burden following the introduction routine rubella vaccination?
+
+Relevant simulations must be performed in `model_simulators.Rmd` prior to running this R Markdown document. 
+
+## Installation of packages 
+
+Here are the packages required: 
+
+```{r include=FALSE}
+required <- c("tidyverse", "sf", "magrittr", "cowplot", "RColorBrewer", "ggrepel")
+to_install <- setdiff(required, row.names(installed.packages()))
+if (length(to_install)) install.packages(to_install)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(sf)
+library(magrittr)
+library(cowplot)
+library(RColorBrewer)
+library(ggrepel)
+```
+
+## Links to local data sets
+
+Here we use the following links to local data:
+
+```{r}
+DATA_FOLDER <- file.path("..", "data")
+PARAMETERS_FOLDER <- file.path("parameters")
+POPULATION_DATA_FOLDER <- file.path(DATA_FOLDER, "population_data")
+SPATIAL_POLYGONS_FOLDER <- file.path(DATA_FOLDER, "spatial_polygons")
+VACCINATION_DATA_FOLDER <- file.path(DATA_FOLDER, "vaccination_data")
+R0_ESTIMATES_FOLDER <- file.path("../R0_estimation/MCMC_estimates/")
+
+# derived data from `nigeria_data_organization_exploration.Rmd`
+ng1_path <- file.path(SPATIAL_POLYGONS_FOLDER, "ng1.rds")
+ng2_pop_path <- file.path(POPULATION_DATA_FOLDER, "ng2_pop.rds")
+ng1_fertility_data_path <- file.path(POPULATION_DATA_FOLDER, "ng1_fertility_data.csv")
+
+# estimates from `R0_estimation.Rmd`
+ng1_r0_summary_path <- file.path(R0_ESTIMATES_FOLDER, "MCMC_piecewise_lambda_fit_R0_summary.rds")
+
+# local data
+ng1_zone_mapping_path <- file.path(POPULATION_DATA_FOLDER, "ng1_zone_designations.xlsx")
+ng1_mcv1_data_path <- file.path(VACCINATION_DATA_FOLDER, "ng1_mcv1_data.xlsx")
+```
+
+These are the paths we use for the simulation output. 
+
+```{r}
+ALL_OUTPUT_FOLDER <- "~/Desktop/output/"
+STATIC_SIMS_FOLDER <- file.path(ALL_OUTPUT_FOLDER, "static_risk_simulations", "raw_simulations")
+LANDSCAPE_SIMS_FOLDER <- file.path(ALL_OUTPUT_FOLDER, "static_risk_simulations", "landscape_simulations")
+SUMMARY_STATIC_SIMS_FOLDER <- file.path(ALL_OUTPUT_FOLDER, "static_risk_simulations", "summary_simulations")
+FIGURES_FOLDER <- file.path("figures", "static_analysis")
+```
+
+Change these paths if you would like to run this on your local device.
+
+## Data sets
+
+Let's read in the main data sets:
+
+```{r}
+ng2_pop <- readRDS(ng2_pop_path)
+ng1_pop <- ng2_pop %>% 
+  group_by(state, gender, agegrp) %>% 
+  summarise(n=sum(n, na.rm=TRUE), .groups="keep") %>% 
+  spread(key="gender", value="n") %>% 
+  mutate(n=m+f) %>% 
+  ungroup()
+ng1_zone_mapping <- as.data.frame(readxl::read_excel(ng1_zone_mapping_path))
+ng1 <- readRDS(ng1_path) %>%
+  left_join(ng1_zone_mapping, by="state")
+ng1_mcv1_data <- readxl::read_excel(ng1_mcv1_data_path)
+ng1_cbr_data <- read.csv(ng1_fertility_data_path) %>% 
+  gather(key="agegrp", value="asfr", 2:ncol(.)) %>% 
+  mutate(agegrp=substr(gsub("X", "", agegrp), 1, 2)) %>%
+  right_join(ng1_pop, by=c("state", "agegrp")) %>% 
+  mutate(asfr=ifelse(is.na(asfr), 0, asfr), 
+         births=asfr*f) %>% 
+  group_by(state) %>% 
+  summarise(cbr=sum(births)/sum(n)*1000, .groups="keep") %>% 
+  as.data.frame()
+ng1_r0_summary <- readRDS(ng1_r0_summary_path)
+```
+
+## Preliminary simulation output data management 
+
+We start by organizing the simulation output. 
+
+### CRS burden: no vaccination
+
+First, we compute the CRS incidence and births time series. 
+
+```{r eval=FALSE}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+crs_incidence_list <- list()
+births_list <- list()
+for (this_state in states) {
+  print(this_state)
+  # retrieve the simulation output for the desired state
+  output_files <- list.files(path=STATIC_SIMS_FOLDER,
+                             pattern=paste(this_state, "tf30", "noVac", sep="_"))
+  num_files <- length(output_files)
+  requested_files <- 200
+  for (ii in 1:requested_files) {
+    output_files[[ii]] <- paste(this_state, "tf30", "noVac", paste0("simNum", ii), sep="_")
+  }
+  output_files <- output_files[1:requested_files]
+  
+  # retrieve the crs incidence and births in each simulation
+  params <- readRDS(file=file.path(PARAMETERS_FOLDER, this_state, "basic_parameters.rds"))
+  state_crs_incidence_list <- list()
+  state_births_list <- list()
+  pb = txtProgressBar(min = 0, max = length(output_files), initial = 0, style=3)
+  for (ii in seq_along(output_files)) {
+    sim <- readRDS(file.path(STATIC_SIMS_FOLDER, output_files[[ii]]))
+    
+    # compute crs incidence
+    EP <- sim[, paste("EP", 1:params$num_stages, sep="")] %>% as.data.frame()
+    sigma <- params$sigma
+    c <- 0.65
+    crs_incidence <- apply(EP, 1, function(x) sum(c*x*sigma))
+    state_crs_incidence_list[[ii]] <- crs_incidence
+    setTxtProgressBar(pb, ii)
+  }
+  close(pb)
+  crs_incidence_list[[this_state]] <- do.call(cbind, state_crs_incidence_list) %>%
+    as.data.frame() %>%
+    mutate(time=sim[, 1]) %>%
+    select(time, dplyr::everything()) %>%
+    setNames(c("time", paste("sim", seq_along(output_files), sep="")))
+  
+  # compute births
+  sim <- readRDS(file.path(STATIC_SIMS_FOLDER, output_files[[1]])) # full results required for first simulation
+  aN <- sapply(1:params$num_stages, function(x) rowSums(sim[, 1+seq(x, ncol(sim)-1, params$num_stages)]))
+  initN <- aN[1, ]
+  total_initN <- sum(initN)
+  births <- rowSums(t(sapply(1:nrow(aN), function(x) aN[x, ]*initN/aN[x, ]*params$f*(1+params$db)^x)))
+  births_list[[this_state]] <- births %>% 
+    as.data.frame() %>% 
+    mutate(time=sim[, 1]) %>% 
+    select(time, dplyr::everything()) %>% 
+    setNames(c("time", "births"))
+}
+saveRDS(crs_incidence_list, file.path(SUMMARY_STATIC_SIMS_FOLDER, "crs_incidence_series_list.rds"))
+saveRDS(births_list, file.path(SUMMARY_STATIC_SIMS_FOLDER, "births_series_list.rds"))
+```
+
+Next, we compute the 30-year CRS burden for each simulation in each state. 
+
+```{r eval=FALSE}
+compute_crs_burden_distribution <- function(this_state, crs_incidence_list, births_list) {
+  state_crs_incidence <- crs_incidence_list[[this_state]]
+  state_births <- births_list[[this_state]]
+  
+  # compute the long-term CRS burden in each simulation
+  crs_burdens <- rep(NA, ncol(state_crs_incidence)-1)
+  for (ii in 1:(ncol(state_crs_incidence)-1)) {
+    crs_incidence <- state_crs_incidence[, 1+ii]
+    births <- state_births[, 2]
+    crs_burdens[ii] <- sum(crs_incidence)/sum(births)*10^5
+  }
+  output <- data.frame(state=this_state, crs_burden=crs_burdens, sim=seq_along(crs_burdens))
+  return(output)
+}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+crs_burden_dist <- do.call(rbind, purrr::map(states, function(x) 
+  compute_crs_burden_distribution(x, crs_incidence_list=crs_incidence_list, births_list=births_list))) %>%
+  left_join(ng1_zone_mapping, by="state")
+saveRDS(crs_burden_dist, file.path(SUMMARY_STATIC_SIMS_FOLDER, "crs_burden_dist.rds"))
+```
+
+### CRS burden: routine vaccination only (MCV1 coverage)
+
+First, we compute the CRS incidence and births time series. 
+
+```{r eval=FALSE}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+crs_incidence_mcv1_list <- list()
+for (this_state in states) {
+  print(this_state)
+  # retrieve the simulation output for the desired state
+  output_files <- list.files(path=STATIC_SIMS_FOLDER,
+                            pattern=paste(this_state, "tf30", "vac", sep="_"))
+  num_files <- length(output_files)
+  requested_files <- 200
+  for (ii in 1:min(num_files, requested_files)) {
+    output_files[[ii]] <- paste(this_state, "tf30", "vac", paste0("simNum", ii), sep="_")
+  }
+  output_files <- output_files[1:min(num_files, requested_files)]
+  
+  # retrieve the crs incidence and births in each simulation
+  params <- readRDS(file=file.path(PARAMETERS_FOLDER, this_state, "basic_parameters.rds"))
+  state_crs_incidence_list <- list()
+  pb = txtProgressBar(min = 0, max = length(output_files), initial = 0, style=3)
+  for (ii in 1:length(output_files)) {
+    sim <- readRDS(file.path(STATIC_SIMS_FOLDER, output_files[[ii]]))
+
+    # compute crs incidence
+    EP <- sim[, paste("EP", 1:params$num_stages, sep="")] %>% as.data.frame()
+    sigma <- params$sigma
+    c <- 0.65
+    crs_incidence <- apply(EP, 1, function(x) sum(c*x*sigma))
+    state_crs_incidence_list[[ii]] <- crs_incidence
+
+    setTxtProgressBar(pb, ii)
+  }
+  close(pb)
+  crs_incidence_mcv1_list[[this_state]] <- do.call(cbind, state_crs_incidence_list) %>% 
+    as.data.frame() %>% 
+    mutate(time=sim[, 1]) %>% 
+    select(time, dplyr::everything()) %>% 
+    setNames(c("time", paste("sim", min(num_files, requested_files), sep="")))
+}
+saveRDS(crs_incidence_mcv1_list, file.path(SUMMARY_STATIC_SIMS_FOLDER, "crs_incidence_mcv1_series_list.rds"))
+```
+
+Next, we compute the long-term CRS burden for each simulation in each state. Here, we combine the results from the simulations with and without routine vaccination at current MCV1 coverage. 
+```{r eval=FALSE}
+compute_crs_burden_distribution <- function(this_state, crs_incidence_list, births_list, vac_status) {
+  state_crs_incidence <- crs_incidence_list[[this_state]]
+  state_births <- births_list[[this_state]]
+  
+  # compute the long-term CRS burden in each simulation
+  crs_burdens <- rep(NA, ncol(state_crs_incidence)-1)
+  for (ii in 1:(ncol(state_crs_incidence)-1)) {
+    crs_incidence <- state_crs_incidence[, 1+ii]
+    births <- state_births[, 2]
+    crs_burdens[ii] <- sum(crs_incidence)/sum(births)*10^5
+  }
+  output <- data.frame(state=this_state, crs_burden=crs_burdens, simNum=1:(ncol(state_crs_incidence)-1), 
+                       vac=vac_status)
+  return(output)
+}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+crs_burden_dist <- do.call(rbind, purrr::map(states, function(x) 
+  compute_crs_burden_distribution(x, crs_incidence_list=crs_incidence_list, births_list=births_list, vac_status="no"))) %>%
+  left_join(ng1_zone_mapping, by="state")
+crs_burden_dist_mcv1 <- do.call(rbind, purrr::map(states, function(x) 
+  compute_crs_burden_distribution(x, crs_incidence_list=crs_incidence_mcv1_list, births_list=births_list, 
+                                  vac_status="yes"))) %>%
+  left_join(ng1_zone_mapping, by="state")
+combined_crs_burden_dist <- rbind(crs_burden_dist, crs_burden_dist_mcv1)
+saveRDS(combined_crs_burden_dist, file=file.path(SUMMARY_STATIC_SIMS_FOLDER, "combined_crs_burden_dist.rds"))
+```
+
+### CRS burden: routine vaccination only (optimal* coverage)
+
+We start by organizing the optimization output. Given computational constraints, we focus on the minimum necessary coverage to prevent relative increases in 30-year CRS burden at the median estimated transmission potential. 
+
+```{r eval=FALSE}
+# state level data
+median_opt_output <- readRDS(file=file.path(SUMMARY_STATIC_SIMS_FOLDER, "median_r0_min_cov_optimization_output.rds"))
+l90_opt_output <- readRDS(file=file.path(SUMMARY_STATIC_SIMS_FOLDER, "l90_r0_min_cov_optimization_output.rds"))
+u90_opt_output <- readRDS(file=file.path(SUMMARY_STATIC_SIMS_FOLDER, "u90_r0_min_cov_optimization_output.rds"))
+median_r0s <- readRDS(file=file.path(SUMMARY_STATIC_SIMS_FOLDER, "median_r0_optimization.rds"))
+l90_r0s <- readRDS(file=file.path(SUMMARY_STATIC_SIMS_FOLDER, "l90_r0_optimization.rds"))
+u90_r0s <- readRDS(file=file.path(SUMMARY_STATIC_SIMS_FOLDER, "u90_r0_optimization.rds"))
+min_vac_cov_list <- list()
+states <- sort(unique(pull(ng2_pop, state)))
+for (this_state in states) {
+  state_median_opt_output <- median_opt_output[[this_state]]
+  state_l90_opt_output <- l90_opt_output[[this_state]]
+  state_u90_opt_output <- u90_opt_output[[this_state]]
+  min_vac_cov_list[[this_state]] <- data.frame(state=this_state, 
+                                               median=round(state_median_opt_output$objective, 2),
+                                               l90=round(state_l90_opt_output$objective, 2),
+                                               u90=round(state_u90_opt_output$objective, 2))
+}
+min_vac_cov <- do.call(rbind, min_vac_cov_list) %>%
+  as.data.frame() %>% 
+  gather(key="metric", value="min_cov", 2:ncol(.)) %>% 
+  mutate(min_cov=as.numeric(min_cov))
+r0s <- data.frame(state=names(median_r0s), median=median_r0s) %>% 
+  left_join(data.frame(state=names(l90_r0s), l90=l90_r0s), by="state") %>%
+  left_join(data.frame(state=names(u90_r0s), u90=u90_r0s), by="state") %>% 
+  gather(key="metric", value="r0", 2:ncol(.))
+min_vac_cov %<>%
+  left_join(r0s, by=c("state", "metric")) %>% 
+  left_join(ng1_zone_mapping, by="state")
+row.names(min_vac_cov) <- NULL
+
+# national level data
+ng0_r0s <- readRDS(file=file.path(SUMMARY_STATIC_SIMS_FOLDER, "ng0_r0_optimization.rds")) %>% 
+  data.frame(metric=names(.), r0=.) %>% 
+  mutate(state="Nigeria", zone=NA)
+ng0_opt_output <- readRDS(file=file.path(SUMMARY_STATIC_SIMS_FOLDER,
+                                         "ng0_r0_min_cov_optimization_output.rds")) %>% 
+  lapply(., function(x) round(x$objective, 2)) %>% 
+  as.numeric() %>% 
+  data.frame(metric=c("median", "l90", "u90"), min_cov=.)
+ng0_min_vac_cov <- ng0_opt_output %>% 
+  left_join(ng0_r0s, by="metric") %>% 
+  select(state, metric, min_cov, r0, zone)
+
+# combined data
+min_vac_cov %<>%
+  rbind(., ng0_min_vac_cov)
+saveRDS(min_vac_cov, file=file.path(SUMMARY_STATIC_SIMS_FOLDER, "min_vac_cov_data.rds"))
+```
+
+### CRS burden: state landscape
+
+We start by computing the CRS incidence and birth time series for each state under increasing levels of routine rubella vaccination coverage. 
+
+```{r eval=FALSE}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+routine_covs <- seq(0, 100, 1)
+median_r0_simNums <- readRDS(file=file.path(SUMMARY_STATIC_SIMS_FOLDER, "median_r0_simNums_optimization.rds"))
+ng0_median_r0_simNum <-readRDS(file=file.path(SUMMARY_STATIC_SIMS_FOLDER, "ng0_r0_simNums_optimization.rds"))["median"]
+median_r0_simNums <- c(median_r0_simNums, "Nigeria"=as.numeric(ng0_median_r0_simNum))
+ng1_landscape_crs_incidence_list <- list()
+ng1_landscape_births_list <- list()
+for (this_state in states) {
+  print(this_state)
+  # retrieve the simulation output for the desired state
+  output_files <- list()
+  for (ii in seq_along(routine_covs)) {
+    output_files[[ii]] <- paste(this_state, "tf30", paste0("cov", routine_covs[ii]), 
+                                paste0("simNum",  median_r0_simNums[this_state]), sep="_")
+  }
+  
+  # retrieve the crs incidence and births in each simulation
+  state_basic_sim <- readRDS(file=file.path(STATIC_SIMS_FOLDER, 
+                                            paste(this_state, "tf30", "noVac", "simNum1", sep="_")))
+  params <- readRDS(file=file.path(PARAMETERS_FOLDER, this_state, "basic_parameters.rds"))
+  state_crs_incidence_list <- list()
+  state_births_list <- list()
+  pb = txtProgressBar(min = 0, max = length(output_files), initial = 0, style=3)
+  for (ii in seq_along(output_files)) {
+    sim <- readRDS(file.path(LANDSCAPE_SIMS_FOLDER, output_files[[ii]]))
+
+    # compute crs incidence
+    EP <- sim[, paste("EP", 1:params$num_stages, sep="")] %>% as.data.frame()
+    sigma <- params$sigma
+    c <- 0.65
+    crs_incidence <- apply(EP, 1, function(x) sum(c*x*sigma))
+    state_crs_incidence_list[[ii]] <- crs_incidence
+    setTxtProgressBar(pb, ii)
+  }
+  close(pb)
+  state_landscape_crs_incidence <- do.call(cbind, state_crs_incidence_list) %>% 
+    as.data.frame() %>% 
+    setNames(paste(routine_covs)) %>% 
+    mutate(time=sim[, 1]) %>% 
+    select(time, dplyr::everything())
+  ng1_landscape_crs_incidence_list[[this_state]] <- state_landscape_crs_incidence
+  
+  aN <- sapply(1:params$num_stages, function(x) rowSums(state_basic_sim[, 1+seq(x, ncol(state_basic_sim)-1, params$num_stages)]))
+  initN <- aN[1, ]
+  total_initN <- sum(initN)
+  births <- rowSums(t(sapply(1:nrow(aN), function(x) aN[x, ]*initN/aN[x, ]*params$f*(1+params$db)^x)))
+  state_basic_births <- births %>% 
+    as.data.frame() %>% 
+    mutate(time=state_basic_sim[, 1]) %>% 
+    select(time, dplyr::everything()) %>% 
+    setNames(c("time", "births"))
+  ng1_landscape_births_list[[this_state]] <- state_basic_births
+}
+saveRDS(ng1_landscape_crs_incidence_list, file.path(SUMMARY_STATIC_SIMS_FOLDER, "ng1_landscape_crs_incidence_series_list.rds"))
+saveRDS(ng1_landscape_births_list, file.path(SUMMARY_STATIC_SIMS_FOLDER, "ng1_landscape_births_series_list.rds"))
+```
+
+Let's compute the 30-year CRS burden for each state under increasing levels of routine rubella vaccination coverage. 
+
+```{r eval=FALSE}
+compute_crs_burden_distribution <- function(this_state, crs_incidence_list, births_list) {
+  state_crs_incidence <- crs_incidence_list[[this_state]]
+  state_births <- births_list[[this_state]]
+  
+  # compute the long-term CRS burden in each simulation
+  crs_burdens <- rep(NA, ncol(state_crs_incidence)-1)
+  for (ii in 1:(ncol(state_crs_incidence)-1)) {
+    crs_incidence <- state_crs_incidence[, 1+ii]
+    births <- state_births[, 2]
+    crs_burdens[ii] <- sum(crs_incidence)/sum(births)*10^5
+  }
+  output <- data.frame(state=this_state, 
+                       vac=as.numeric(colnames(state_crs_incidence[,-1])), 
+                       crs_burden=as.numeric(crs_burdens))
+  smoothed_crs_burden <- predict(loess(crs_burden~vac, data=output, span=0.12))
+  output %<>% mutate(smoothed_crs_burden)
+  return(output)
+}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+state_landscape_crs_burden_dist <- do.call(rbind, purrr::map(states, function(x) 
+  compute_crs_burden_distribution(x, 
+                                  crs_incidence_list=ng1_landscape_crs_incidence_list, 
+                                  births_list=ng1_landscape_births_list))) %>%
+  left_join(ng1_zone_mapping, by="state")
+saveRDS(state_landscape_crs_burden_dist, file=file.path(SUMMARY_STATIC_SIMS_FOLDER, "state_landscape_crs_burden_dist.rds"))
+```
+
+## Simulation datasets
+
+Here, we read in the organized simulation output data. 
+
+### CRS burden: no vaccination
+
+```{r}
+crs_incidence_list <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "crs_incidence_series_list.rds"))
+births_list <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "births_series_list.rds"))
+crs_burden_dist <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "crs_burden_dist.rds"))
+```
+
+### CRS burden: routine vaccination only (MCV1 coverage)
+
+```{r}
+crs_incidence_mcv1_list <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "crs_incidence_mcv1_series_list.rds"))
+combined_crs_burden_dist <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "combined_crs_burden_dist.rds"))
+```
+
+### CRS burden: routine vaccination only (optimal* coverage)
+
+```{r}
+min_vac_cov_data <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "min_vac_cov_data.rds"))
+```
+
+### CRS burden: landscape
+
+```{r}
+ng1_landscape_crs_incidence_list <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "ng1_landscape_crs_incidence_series_list.rds"))
+ng1_landscape_births_list <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "ng1_landscape_births_series_list.rds"))
+state_landscape_crs_burden_dist <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "state_landscape_crs_burden_dist.rds"))
+```
+
+## CRS burden: no vaccination
+
+We start by exploring how CRS burden changes in time and across space in Nigeria in the absence of any rubella vaccination. 
+
+### Yearly CRS incidence (time-series)
+
+Here, we look at the time series of CRS burden in each state to get an idea of the possible temporal dynamics.
+
+```{r}
+# It takes the state name and returns a time series of the yearly CRS burden with uncertainty bars. 
+plot_yearly_crs_dynamics <- function(this_state, crs_incidence_list, births_list) {
+  state_crs_incidence <- crs_incidence_list[[this_state]]
+  state_births <- births_list[[this_state]]
+  
+  # compute the yearly crs incidence (per 100,000 live births) in each simulation
+  yearly_incidence_list <- list()
+  yearly_incidence <- rep(0, floor(nrow(state_crs_incidence)/365))
+  for (ii in 1:(ncol(state_crs_incidence)-1)) {
+    crs_incidence <- state_crs_incidence[, 1+ii]
+    births <- state_births[, 2]
+    for (jj in seq(1, length(crs_incidence)-1, 365)) {
+      yearly_incidence[floor(jj/365)+1] <- sum(crs_incidence[jj:(jj+364)])/sum(births[jj:(jj+364)])*10^5
+    }
+    yearly_incidence_list[[ii]] <- yearly_incidence
+  }
+ state_yearly_incidence <- do.call(cbind, yearly_incidence_list) %>% 
+   as.data.frame() %>% 
+   mutate(year=seq(1, floor(nrow(state_crs_incidence)/365), 1)) %>% 
+   select(year, dplyr::everything())
+ state_yearly_incidence_summary <- apply(state_yearly_incidence, 1, function(x) 
+                                         c(median(x), mean(x), sd(x), quantile(x, c(0.025, 0.975)))) %>% 
+   t() %>% 
+   as.data.frame() %>% 
+   mutate(year=seq(1, floor(nrow(state_crs_incidence)/365), 1)) %>% 
+   select(year, dplyr::everything()) %>% 
+   setNames(c("year", "median", "mean", "sd", "l95", "u95"))
+ 
+  p <- ggplot(state_yearly_incidence_summary) + 
+    geom_errorbar(aes(x=year, ymin=mean-sd, ymax=mean+sd), width=.2) + 
+    geom_line(mapping=aes(x=year, y=mean), color="steelblue", size=1) + 
+    geom_point(mapping=aes(x=year, y=mean), size=1) +
+    labs(x="Year", y="CRS cases/\n100,000 live births", title=this_state) + 
+    scale_x_continuous(breaks=seq(0, 30, 5), limits=c(0, 30)) + 
+    theme_bw() + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(),
+          axis.line = element_line(colour = "black")) + 
+    theme(axis.text = element_text(size=12), axis.title = element_text(size=14))
+  return(p)
+}
+```
+
+```{r echo=FALSE}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+plots <- purrr::map(states, function(x) 
+  plot_yearly_crs_dynamics(x, crs_incidence_list=crs_incidence_list, births_list=births_list))
+pdf(file=file.path(FIGURES_FOLDER, "yearly_crs_incidence_timeseries.pdf"), w=8.5, h=11)
+plots_per_page <- 5
+groupings <- split(seq_along(plots), ceiling(seq_along(plots)/plots_per_page))
+for (ii in seq_along(groupings)) {
+  plots_subset <- plots[groupings[[ii]]]
+  num_plots_subset <- length(plots_subset)
+  if (num_plots_subset<plots_per_page) {
+    for (jj in 1:(plots_per_page-num_plots_subset)) {
+      plots_subset[[jj+num_plots_subset]] <- cowplot::ggdraw()
+    }
+  }
+  print(cowplot::plot_grid(plotlist=plots_subset, ncol=1))
+}
+a <- dev.off()
+```
+
+### CRS burden distribution (by state)
+
+In this section, we compute the distribution of the 30-year CRS burden in each state, which is defined as the total number of CRS cases per 100,000 live births over a 30-year period. 
+
+Let's plot the 30-year CRS burden distribution in each state in the absence of any routine vaccination. 
+
+```{r}
+plot_crs_burden_boxplots <- function(states, crs_burden_dist, file_name) {
+  crs_burden_dist %<>%
+    mutate(state=ifelse(state=="Federal Capital Territory", "FCT", state)) %>% 
+    mutate(zone=ifelse(state=="Nigeria", "National", zone))
+  state_order <- crs_burden_dist %>% pull(state) %>% unique() %>% sort() 
+  state_order <- c(state_order[-which(state_order=="Nigeria")], "Nigeria")
+  crs_burden_dist %<>%
+    mutate(state=factor(state, levels=state_order))
+  zone_colors <- c(brewer.pal(8, "Pastel1")[c(1:5, 7)], "grey")
+  zone_order <- c("North Central", "North East", "North West", 
+                  "South East", "South South", "South West", "National")
+  
+  crs_burden_boxplot <- ggplot(data=crs_burden_dist) + 
+    geom_boxplot(mapping=aes(x=state, y=crs_burden, fill=zone, color=zone)) + 
+    labs(y="CRS cases/100,000 live births") + 
+    scale_fill_manual(breaks=zone_order, values=zone_colors, 
+                      guide=guide_legend(ncol=1)) + 
+    scale_color_manual(breaks=zone_order, values=c(rep("black", 6), "black"), 
+                       guide="none") + 
+    scale_y_continuous(limits=c(0, 130), breaks=seq(0, 125, 25)) + 
+    theme_bw() + 
+    theme(axis.title.x=element_blank(), 
+          axis.text.x=element_text(size=8, angle=90, vjust=0.4, hjust=1, 
+                                   colour=c(rep("black", length(states)), "red")), 
+          axis.title.y=element_text(size=8, color="black"), 
+          legend.title=element_blank(), 
+          legend.text=element_text(size=8)) + 
+    theme(legend.position = c(0.92, 0.8), legend.key.size=unit(0.5, "cm"), 
+          legend.background = element_blank(),
+          legend.box.background = element_blank()) + 
+    theme(plot.margin=unit(c(0.1, 0.1, 0.1, 0.1), "cm"), 
+          panel.grid.minor=element_blank(), panel.grid.major.x=element_blank(), 
+          panel.background=element_blank(), panel.border=element_blank(), 
+          axis.line.x.bottom = element_line(colour="black"), 
+          axis.line.y.left = element_line(colour="black"))
+  
+  
+  scale_factor <- 0.4
+  pdf(file=file.path(FIGURES_FOLDER, file_name), w=8.5, h=11*scale_factor) 
+  print(crs_burden_boxplot)
+  a <- dev.off()
+  return(crs_burden_boxplot)
+}
+states <- sort(unique(pull(ng2_pop, state)))
+p <- plot_crs_burden_boxplots(states, crs_burden_dist, file_name="crs_burden_noVac_distribution.pdf")
+p
+```
+
+### CRS burden map
+
+Here, we plot the mean long-term CRS burden in each state on a geographical map of Nigeria. 
+
+```{r}
+plot_crs_burden_map <- function(states, crs_burden_dist, ng1) {
+  mean_crs_burden <- crs_burden_dist %>% 
+    group_by(state) %>% 
+    summarise(mean_crs_burden=mean(crs_burden), .groups="keep") %>%
+    right_join(ng1, by="state")
+  
+  crs_burden_noVac_map <- ggplot() + 
+    geom_sf(data=mean_crs_burden, mapping=aes(geometry=geometry, fill=mean_crs_burden)) + 
+    scale_fill_gradientn(limits=c(0, 125), breaks=seq(0, 125, 25), colors=brewer.pal(9, "YlOrRd"), name="Mean\nCRS burden")+ 
+    guides(fill=guide_colorbar(ticks.colour="black", frame.colour="black")) + 
+    theme_bw() + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(), 
+          axis.line=element_blank(), axis.ticks=element_blank(), axis.text=element_blank(), 
+          axis.title=element_blank()) + 
+    theme(legend.position=c(0.91, 0.2), legend.key.size=unit(0.3, "cm"), legend.key.width=unit(0.5, "cm"), 
+          legend.key.height=unit(0.4, "cm"), 
+          legend.text=element_text(size=7), legend.title=element_text(size=7), 
+          legend.box.background=element_blank(), legend.background=element_blank()) 
+  
+  return(crs_burden_noVac_map)
+}
+crs_burden_no_vac_map <- plot_crs_burden_map(states, crs_burden_dist, ng1) 
+crs_burden_no_vac_map
+```
+
+## CRS burden: routine vaccination only (MCV1 coverage)
+
+In this section, we introduce routine vaccination of infants into our model. Specifically, we vaccinate children at 9 months with a 100% efficacious RCV at a coverage equal to current MCV1 coverage in each of the states (state-level MCV1 coverage is sourced from 2019 Nigeria DHS data). The following series of plots compare CRS burden with and without routine vaccination (set to MCV1 coverage) in each of the states. In particular, we are interested in whether the introduction of RCV into the current MCV schedule in each of the states increases or decreases 30-year CRS burden. 
+
+### Yearly CRS incidence with and without routine vaccination (time-series)
+
+Here, we look at the time series of CRS incidence in each state to get an idea of the possible temporal dynamics.
+
+```{r include=FALSE}
+# It takes the state name and returns a time series of the yearly CRS burden with uncertainty bars. 
+plot_yearly_crs_dynamics <- function(this_state, crs_incidence_list, crs_incidence_mcv1_list, 
+                                     births_list, births_mcv1_list) {
+  state_crs_incidence <- crs_incidence_list[[this_state]]
+  state_births <- births_list[[this_state]]
+  state_crs_incidence_mcv1 <- crs_incidence_mcv1_list[[this_state]]
+  
+  num_sims <- min(ncol(state_crs_incidence_mcv1), ncol(state_crs_incidence))-1
+  mcv1_cov <- as.numeric(ng1_mcv1_data[which(ng1_mcv1_data$state==this_state), "MCV1"])
+  
+  # compute the yearly crs incidence (per 100,000 live births) in each simulation
+  yearly_incidence_list <- list()
+  yearly_incidence_mcv1_list <- list()
+  yearly_incidence <- rep(0, floor(nrow(state_crs_incidence)/365))
+  yearly_incidence_mcv1 <- rep(0, floor(nrow(state_crs_incidence)/365))
+  for (ii in 1:num_sims) {
+    crs_incidence <- state_crs_incidence[, 1+ii]
+    births <- state_births[, 2]
+    crs_incidence_mcv1 <- state_crs_incidence_mcv1[, 1+ii]
+    for (jj in seq(1, length(crs_incidence)-1, 365)) {
+      yearly_incidence[floor(jj/365)+1] <- sum(crs_incidence[jj:(jj+364)])/sum(births[jj:(jj+364)])*10^5
+      yearly_incidence_mcv1[floor(jj/365)+1] <- sum(crs_incidence_mcv1[jj:(jj+364)])/sum(births[jj:(jj+364)])*10^5
+    }
+    yearly_incidence_list[[ii]] <- yearly_incidence
+    yearly_incidence_mcv1_list[[ii]] <- yearly_incidence_mcv1
+  }
+ state_yearly_incidence <- do.call(cbind, yearly_incidence_list) %>% 
+   as.data.frame() %>% 
+   mutate(vac=FALSE, year=seq(1, floor(nrow(state_crs_incidence)/365), 1)) %>% 
+   select(year, vac, dplyr::everything())
+ state_yearly_incidence_mcv1 <- do.call(cbind, yearly_incidence_mcv1_list) %>% 
+   as.data.frame() %>% 
+   mutate(vac=TRUE, year=seq(1, floor(nrow(state_crs_incidence)/365), 1)) %>% 
+   select(year, vac, dplyr::everything())
+ complete_state_yearly_incidence <- rbind(state_yearly_incidence, state_yearly_incidence_mcv1)
+ 
+ state_yearly_incidence_summary <- complete_state_yearly_incidence %>% 
+   gather(key="sim", value="number", 3:ncol(.)) %>% 
+   group_by(year, vac) %>% 
+   summarise(mean=mean(number), median=median(number), sd=sd(number), 
+             l95=quantile(number, 0.025), u95=quantile(number, 0.975), .groups="keep")
+ 
+  p <- ggplot(state_yearly_incidence_summary) + 
+    geom_errorbar(aes(x=year, ymin=mean-sd, ymax=mean+sd, group=vac), width=.2) + 
+    geom_line(mapping=aes(x=year, y=mean, group=vac, color=vac), size=1) + 
+    geom_point(mapping=aes(x=year, y=mean, group=vac), size=1) +
+    labs(x="Year", y="CRS cases/\n100,000 live births", title=this_state, 
+         subtitle=paste0("RCV coverage: ", mcv1_cov, "%")) + 
+    scale_x_continuous(breaks=seq(0, 30, 5)) +
+    scale_color_manual(breaks=c(TRUE, FALSE), values=c("red4", "steelblue"), labels=c("Vaccination", "No vaccination")) + 
+    theme_bw() + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(),
+          axis.line = element_line(colour = "black")) + 
+    theme(axis.text = element_text(size=12), axis.title = element_text(size=14), 
+          plot.title=element_text(size=14), plot.subtitle=element_text(size=12)) + 
+    theme(legend.position = c(.13, .95), legend.justification = c("right", "top"),
+          legend.box.just = "right", legend.margin = margin(1, 1, 1, 1), 
+          legend.text = element_text(size=8), legend.key.size=unit(0.25, 'cm'), 
+          legend.box.background = element_rect(colour="black"), legend.title = element_blank())
+  return(p)
+}
+```
+
+```{r echo=FALSE}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+plots <- purrr::map(states, function(x) 
+  plot_yearly_crs_dynamics(x, crs_incidence_list=crs_incidence_list, births_list=births_list, 
+                           crs_incidence_mcv1_list= crs_incidence_mcv1_list))
+pdf(file=file.path(FIGURES_FOLDER, "yearly_crs_incidence_combined_timeseries.pdf"), w=8.5, h=11)
+plots_per_page <- 5
+groupings <- split(seq_along(plots), ceiling(seq_along(plots)/plots_per_page))
+for (ii in seq_along(groupings)) {
+  plots_subset <- plots[groupings[[ii]]]
+  num_plots_subset <- length(plots_subset)
+  if (num_plots_subset<plots_per_page) {
+    for (jj in 1:(plots_per_page-num_plots_subset)) {
+      plots_subset[[jj+num_plots_subset]] <- cowplot::ggdraw()
+    }
+  }
+  print(cowplot::plot_grid(plotlist=plots_subset, ncol=1))
+}
+a <- dev.off()
+```
+Each plot shows the time series of yearly CRS burden (cases per 100,000 live births) in a given state with the blue line corresponding to the no vaccination scenario and the red line the routine vaccination scenario.
+
+### Impact of routine vaccination on CRS burden
+
+Let's start by looking at the impact of routine rubella vaccination at current MCV1 coverage levels on 30-year CRS burden in each state.  
+
+First, let's plot a map of the existing rubella coverage in each state. 
+
+```{r}
+plot_mcv1_cov_map <- function(states, mcv1_data, ng1) {
+  mcv1_data <- mcv1_data %>% 
+    left_join(ng1, by="state")
+  
+  mcv1_map <- ggplot() + 
+    geom_sf(data=mcv1_data, mapping=aes(geometry=geometry, fill=MCV1)) + 
+    scale_fill_gradientn(limits=c(0, 100), breaks=seq(0, 100, 20), colors=brewer.pal(9, "Blues"), 
+                         name="Routine\ncoverage", 
+                         labels=c("0%", "20%", "40%", "60%", "80%", "100%"))+ 
+    guides(fill=guide_colorbar(ticks.colour="black", frame.colour="black")) + 
+    theme_bw() + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(), 
+          axis.line=element_blank(), axis.ticks=element_blank(), axis.text=element_blank(), 
+          axis.title=element_blank()) + 
+    theme(legend.position=c(0.91, 0.2), legend.key.size=unit(0.3, "cm"), legend.key.width=unit(0.5, "cm"), 
+          legend.key.height=unit(0.4, "cm"), 
+          legend.text=element_text(size=7), legend.title=element_text(size=7), 
+          legend.box.background=element_blank(), legend.background=element_blank()) 
+  return(mcv1_map)
+}
+mcv1_cov_map <- plot_mcv1_cov_map(states=sort(unique(pull(ng2_pop, state))), 
+                                  mcv1_data=ng1_mcv1_data, 
+                                  ng1=ng1)
+mcv1_cov_map
+```
+
+Next, let's plot a map of the ratio of the long-term CRS burden with routine vaccination and without routine vaccination. 
+
+```{r}
+plot_crs_burden_ratio <- function(states, crs_burden_dist, ng1) {
+  crs_burden_noVac_dist <- crs_burden_dist %>% 
+    filter(vac=="no") %>% 
+    transmute(state=state, noVac_crs_burden=crs_burden, simNum=simNum, zone=zone)
+  crs_burden_vac_dist <- crs_burden_dist %>%
+    filter(vac=="yes") %>% 
+    transmute(state=state, vac_crs_burden=crs_burden, simNum=simNum, zone=zone)
+  crs_burden_change_dist <- crs_burden_noVac_dist %>% 
+    left_join(crs_burden_vac_dist, by=c("state", "simNum", "zone")) %>% 
+    mutate(crs_burden_ratio=vac_crs_burden/noVac_crs_burden) %>%
+    group_by(state) %>% 
+    summarise(mean_ratio=mean(crs_burden_ratio), .groups="keep") %>% 
+    mutate(state=ifelse(state=="Federal Capital Territory", "FCT", state)) %>% 
+    ungroup() %>% 
+    left_join(ng1, by="state")
+  
+  colors <- c(colorRampPalette(colors=c(rep(rev(brewer.pal(9, "RdBu"))[1:4], each=2), "white"))(20), 
+                 rev(colorRampPalette(colors=c(rep(brewer.pal(9, "RdBu")[1:4], each=2), "white"))(15)))
+  crs_burden_ratio_map <- ggplot() + 
+    geom_sf(data=crs_burden_change_dist, mapping=aes(geometry=geometry, fill=mean_ratio)) + 
+    scale_fill_gradientn(limits=c(0, 1.83), breaks=seq(0, 1.80, 0.3), name="CRS burden\nratio", 
+                         colors=colors)+ 
+    guides(fill=guide_colorbar(ticks.colour="black", frame.colour="black")) + 
+    theme_bw() + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(), 
+          axis.line=element_blank(), axis.ticks=element_blank(), axis.text=element_blank(), 
+          axis.title=element_blank()) + 
+    theme(legend.position=c(0.91, 0.2), legend.key.size=unit(0.3, "cm"), legend.key.width=unit(0.5, "cm"), 
+          legend.key.height=unit(0.4, "cm"), 
+          legend.text=element_text(size=7), legend.title=element_text(size=7), 
+          legend.box.background=element_blank(), legend.background=element_blank()) 
+  return(crs_burden_ratio_map)
+  
+}
+crs_burden_ratio_map <- plot_crs_burden_ratio(states=sort(unique(pull(ng2_pop, state))), 
+                                              crs_burden_dist=combined_crs_burden_dist,
+                                              ng1=ng1)
+crs_burden_ratio_map
+```
+
+Next, let's plot the change in 30-year CRS burden following the introduction of the routine vaccination. 
+
+```{r}
+plot_crs_burden_change <- function(states, crs_burden_dist, mcv1_data) {
+  # organize crs burden data
+  crs_burden_noVac_dist <- crs_burden_dist %>% 
+    filter(vac=="no") %>% 
+    transmute(state=state, noVac_crs_burden=crs_burden, simNum=simNum, zone=zone)
+  crs_burden_vac_dist <- crs_burden_dist %>%
+    filter(vac=="yes") %>% 
+    transmute(state=state, vac_crs_burden=crs_burden, simNum=simNum, zone=zone)
+  crs_burden_change_dist <- crs_burden_noVac_dist %>% 
+    left_join(crs_burden_vac_dist, by=c("state", "simNum", "zone")) %>% 
+    mutate(crs_burden_change=vac_crs_burden-noVac_crs_burden, 
+           percent_change=(vac_crs_burden-noVac_crs_burden)/noVac_crs_burden) %>%
+    mutate(state=ifelse(state=="Federal Capital Territory", "FCT", state)) %>% 
+    mutate(zone=ifelse(state=="Nigeria", "", zone)) %>% 
+    group_by(state, zone) %>% 
+    summarise(median=median(crs_burden_change), 
+              l50=quantile(crs_burden_change, 0.25), 
+              u50=quantile(crs_burden_change, 0.75), 
+              l90=quantile(crs_burden_change, 0.05), 
+              u90=quantile(crs_burden_change, 0.95), .groups="keep")
+  
+  # organize routine vaccination data
+  mcv1_data %<>%
+    mutate(state=ifelse(state=="Federal Capital Territory", "FCT", state))
+  
+  # order the states
+  state_order <- crs_burden_change_dist %>% 
+    filter(state!="Nigeria") %>% 
+    select(zone, state) %>% 
+    unique() %>% 
+    arrange(desc(zone), desc(state)) %>% 
+    pull(state) 
+  crs_burden_change_dist %<>% mutate(state=factor(state, 
+                                                  levels=c("Nigeria", state_order))) 
+  mcv1_data %<>% mutate(state=factor(state, levels=c(state_order, "Nigeria")))
+  
+  zone_colors <- c(brewer.pal(8, "Pastel1")[c(1:5, 7)], "grey")
+  zone_order <- c("North Central", "North East", "North West", 
+                  "South East", "South South", "South West", "National")
+  crs_burden_change_distribution <- ggplot(data=crs_burden_change_dist) + 
+    geom_errorbar(mapping=aes(x=state, ymin=l90, ymax=u90), color="#8DA0CB", width=0) + 
+    geom_errorbar(mapping=aes(x=state, ymin=l50, ymax=u50), color="darkred", width=0, size=0.7) + 
+    geom_point(mapping=aes(x=state, y=median), color="black", shape=21, fill="white") +
+    geom_hline(yintercept=0, linetype="dashed") + 
+    labs(y="Change in CRS burden") + 
+    scale_fill_manual(breaks=zone_order, values=zone_colors, guide="none") + 
+    scale_y_continuous(limits=c(-100, 20), breaks=seq(-100, 20, 20)) + 
+    coord_flip() + 
+    theme_bw() + 
+    theme(axis.text.x = element_text(size=7, color="black"), 
+          axis.text.y=element_text(size=7,
+                                   colour=c("black")),
+          axis.title = element_text(size=7, color="black"), 
+          strip.text=element_text(size=7, color="black"), 
+          axis.title.y=element_blank()) + 
+    facet_grid(rows=vars(zone), scales = "free_y", space = "free_y") + 
+    theme(panel.spacing = unit(0, units = "cm"), strip.placement = "inside") + 
+    theme(panel.grid.major.x=element_blank(), panel.grid.minor.x=element_blank(),
+          panel.grid=element_blank(), 
+          panel.background=element_blank(), strip.background=element_rect(fill="white")) + 
+    theme(plot.margin = unit(c(0.05, 0, 0.2, 0.2), "cm"))
+  
+  mcv1_cov_barplot <- ggplot(data=mcv1_data) + 
+    geom_bar(mapping=aes(x=state, y=MCV1), width=0.95, color="black", fill="#8DA0CB", stat="identity") + 
+    geom_text(mapping=aes(x=state, y=MCV1+7, label=paste0(MCV1, "%", sep="")), size=2) + 
+    geom_text(data=data.frame(x=20, y=111, label="Routine coverage"), 
+              mapping=aes(x=x, y=y, label=label), angle=90, size=2.75) + 
+    scale_y_continuous(limits=c(0, 120), breaks=seq(0, 100, 25), labels=rep("", length(seq(0, 100, 25))), 
+                       expand=c(0, 1), name="") +
+    theme_bw() + 
+    theme(axis.text.y=element_blank(), axis.title.y=element_blank(), 
+          axis.text.x = element_text(size=7, color="black"), axis.title.x = element_text(size=7, color="black"), 
+          strip.text=element_text(size=7, color="black"),
+          axis.ticks.y=element_blank()) + 
+    theme(panel.background=element_blank(), panel.border=element_blank(), panel.grid=element_blank(), 
+          axis.line.x.bottom=element_blank(), axis.ticks.x=element_blank(), axis.line.y.left=element_line(color="black")) + 
+    theme(plot.margin = unit(c(0.05, 0, 0.2, 0), "cm")) + 
+    coord_flip()
+  
+  combined_plot <- cowplot::plot_grid(crs_burden_change_distribution, mcv1_cov_barplot, nrow=1, rel_widths=c(1, 0.4))
+  return(combined_plot)
+}
+crs_burden_change_boxplot <- plot_crs_burden_change(states=c(sort(unique(pull(ng2_pop, state))), "Nigeria"),
+                                                    crs_burden_dist=combined_crs_burden_dist, 
+                                                    mcv1_data=rbind(ng1_mcv1_data, 
+                                                                    data.frame(state="Nigeria", MCV1=54)))
+crs_burden_change_boxplot
+```
+
+Let's create a combined plot for presentation...
+
+```{r}
+pABC <- cowplot::plot_grid(mcv1_cov_map, crs_burden_no_vac_map, crs_burden_ratio_map, nrow=1, 
+                           labels=c("(a)", "(b)", "(c)"), label_size=10, label_fontface="plain", label_fontfamily="serif")
+pABCD <- cowplot::plot_grid(pABC, NULL, crs_burden_change_boxplot, ncol=1, rel_heights=c(0.55, 0.01, 1), 
+                            labels=c("", "", "(d)"), label_size=10, label_fontface="plain", label_fontfamily="serif")
+
+scale_factor <- 0.6
+pdf(file=file.path(FIGURES_FOLDER, "crs_burden_change_plot.pdf"), w=8.5, h=11*scale_factor)
+print(pABCD)
+a <- dev.off()
+```
+
+## CRS burden: routine vaccination only (optimal* coverage)
+
+In this section, we estimate the minimum necessary coverage to prevent increases in 30-year CRS burden in each state. 
+
+### Minimum coverage map
+
+We start by plotting the minimum necessary coverage in each state on a geographical map of Nigeria. 
+
+```{r echo=FALSE, warning=FALSE}
+plot_min_vac_cov_map <- function(min_vac_cov_data, ng1) {
+  min_vac_cov_data <- min_vac_cov_data %>%
+    filter(metric=="median") %>% 
+    right_join(ng1, by="state")
+  
+  cb <- rev(RColorBrewer::brewer.pal(9, "RdPu"))
+  color_generator <- colorRampPalette(cb)
+  pal <- rev(color_generator(10))
+  
+  min_vac_cov_map <- ggplot() + 
+    geom_sf(data=min_vac_cov_data, aes(geometry=geometry, fill=min_cov*100)) + 
+    scale_fill_gradientn(breaks=seq(0, 100, 20), limits=c(0, 100), colors=rep(pal, each=10), 
+                         labels=paste(seq(0, 100, 20), "%", sep=""), name="Necessary\ncoverage", 
+                         guide=guide_colorbar(frame.colour="black", ticks.colour="black", title.position="top")) + 
+    theme_bw() + 
+        theme(legend.position=c(0.91, 0.2), legend.key.size=unit(0.3, "cm"), legend.key.width=unit(0.5, "cm"), 
+          legend.key.height=unit(0.38, "cm"), 
+          legend.text=element_text(size=6), legend.title=element_text(size=6), 
+          legend.box.background=element_blank(), legend.background=element_blank()) + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(), 
+          axis.title = element_blank(), axis.line=element_blank(), axis.ticks=element_blank(), 
+          axis.text=element_blank()) + 
+    theme(plot.margin = unit(c(0.05, 0.3, 0.05, 0.05), "cm"))
+  
+  return(min_vac_cov_map)
+}
+min_vac_cov_map <- plot_min_vac_cov_map(min_vac_cov_data=min_vac_cov_data, ng1=ng1)
+min_vac_cov_map
+```
+Here, we plot a geographical map of the minimum routine vaccination coverage required to ensure that there is not a long-term increase in CRS burden following the introduction of routine vaccination.
+
+### Minimum coverage as function of birth rate and $R_0$
+
+```{r echo=FALSE}
+plot_min_cov_br_r0 <- function(min_vac_cov_data, ng1_cbr_data, ng1) {
+  min_vac_cov_data %<>%
+    filter(metric=="median") %>% 
+    left_join(ng1_cbr_data, by="state") %>% 
+    right_join(ng1, by="state")
+
+  p <- ggplot(data=min_vac_cov_data) + 
+    geom_point(mapping=aes(x=cbr, y=r0, fill=min_cov*100), size=8, color="grey", shape=21) + 
+    geom_label_repel(mapping=aes(x=cbr, y=r0, label=state), size=2) + 
+    scale_x_continuous(breaks=seq(20, 50, 5), limits=c(20, 50)) + 
+    scale_y_continuous(breaks=seq(2, 7, 1), limits=c(2, 7)) + 
+    scale_fill_gradientn(breaks=seq(0, 100, 20), limits=c(0, 100), colors=rev(brewer.pal(9, "RdYlBu")), 
+                         labels=paste(seq(0, 100, 20), "%", sep="")) + 
+    labs(x="Crude birth rate", y="Basic reproductive number", fill="Necessary \ncoverage") + 
+    theme_bw() + 
+    theme(axis.text = element_text(size=8), axis.title = element_text(size=8), 
+          legend.text = element_text(size=8), legend.title=element_text(size=8))
+  return(p)
+}
+min_cov_br_r0_plot  <- plot_min_cov_br_r0(min_vac_cov_data=min_vac_cov_data, ng1_cbr_data=ng1_cbr_data, ng1=ng1)
+min_cov_br_r0_plot
+```
+Here, we plot the minimum coverage required to prevent long-term increases in CRS burden following introduction of routine vaccination as a function of crude birth rate and $R_0$. 
+
+### Minimum necessary RCV coverage vs. current MCV1 coverage
+
+Let's map out the states according to whether their current MCV1 coverage is above or below the minimum necessary RCV coverage required to prevent increases in long-term CRS burden. 
+
+```{r echo=FALSE, warning=FALSE}
+plot_min_cov_mcv1_map <- function(min_vac_cov_data, ng1_mcv1_data, ng1) {
+  min_vac_cov_data %<>%
+    filter(metric=="median") %>% 
+    left_join(ng1_mcv1_data, by="state") %>% 
+    mutate(min_cov=min_cov*100) %>%
+    mutate(change=ifelse(MCV1<min_cov, "higher", "lower")) %>% 
+    right_join(ng1, by="state")
+  
+  p <- ggplot(min_vac_cov_data) + 
+    geom_sf(aes(geometry=geometry, fill=change)) + 
+    scale_fill_manual(breaks=c("higher", "lower"), values=c("#E64B35FF", "#00A087FF"), 
+                      labels=c("Requires increase", "Sufficient")) + 
+    theme_bw() + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(), 
+          axis.line=element_blank(), axis.ticks=element_blank(), axis.text=element_blank(), 
+          axis.title=element_blank()) + 
+    theme(legend.position=c(0.91, 0.2), legend.key.size=unit(0.3, "cm"), legend.key.width=unit(0.4, "cm"), 
+          legend.key.height=unit(0.4, "cm"), 
+          legend.text=element_text(size=7), legend.title=element_text(size=7), 
+          legend.box.background=element_blank(), legend.background=element_blank()) 
+  return(p)
+}
+min_cov_mcv1_map <- plot_min_cov_mcv1_map(min_vac_cov_data=min_vac_cov_data, ng1_mcv1_data=ng1_mcv1_data, ng1=ng1)
+min_cov_mcv1_map 
+```
+
+Let's quantify the difference between current MCV1 coverage and estimated minimum safe level routine vaccination coverage. 
+
+```{r}
+plot_min_cov_mcv1_diff_map <- function(min_vac_cov_data, ng1_mcv1_data, ng1) {
+  pp_groups <- seq(-75, 50, 25)
+  pp_group_labels <- c("(-100, -75]", "(-75, -50]", "(-50, -25]", "(-25, 0]", 
+                       "(0, 25]", "(25, 50]", "(50, 75]")
+  min_vac_cov_data %<>%
+    filter(metric=="median") %>% 
+    left_join(ng1_mcv1_data, by="state") %>% 
+    mutate(min_cov=min_cov*100) %>%
+    mutate(change=ifelse(MCV1<min_cov, "higher", "lower"), diff=min_cov-MCV1) %>% 
+    right_join(ng1, by="state") %>% 
+    mutate(pp_group=factor(findInterval(diff, pp_groups), length(pp_groups):0))
+  
+  p <- ggplot(min_vac_cov_data) + 
+    geom_sf(aes(geometry=geometry, fill=pp_group)) + 
+    scale_fill_manual(breaks=length(pp_groups):0, values=c(brewer.pal(8, "RdYlBu")[c(1, 2, 4)], brewer.pal(8, "RdYlBu")[5:8]), 
+                      labels=rev(pp_group_labels), name="Coverage\ndifference (pp)") + 
+    theme_bw() + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(), 
+          axis.line=element_blank(), axis.ticks=element_blank(), axis.text=element_blank(), 
+          axis.title=element_blank()) + 
+    theme(legend.position=c(0.91, 0.2), legend.key.size=unit(0.3, "cm"), legend.key.width=unit(0.4, "cm"), 
+          legend.key.height=unit(0.28, "cm"), 
+          legend.text=element_text(size=6), legend.title=element_text(size=6), 
+          legend.box.background=element_blank(), legend.background=element_blank()) + 
+    theme(plot.margin = unit(c(0.05, 0.3, 0.05, 0.05), "cm"))
+  return(p)
+}
+min_cov_mcv1_diff_map <- plot_min_cov_mcv1_diff_map(min_vac_cov_data=min_vac_cov_data, ng1_mcv1_data=ng1_mcv1_data, ng1=ng1)
+min_cov_mcv1_diff_map
+```
+
+## CRS burden: state landscape
+
+First, let's have a look at the long-term CRS burden as a function of vaccination coverage curves for each state individually. 
+
+```{r include=FALSE}
+plot_crs_burden_vac_curve <- function(this_state, crs_burden_dist) {
+  state_crs_burden_dist <- crs_burden_dist %>% filter(state==this_state)
+
+  p <- ggplot(state_crs_burden_dist) + 
+    geom_line(mapping=aes(x=vac, y=smoothed_crs_burden), color="steelblue", size=1) + 
+    labs(x="RCV coverage", y="CRS cases/\n100,000 live births", title=this_state) + 
+    scale_x_continuous(breaks=seq(0, 100, 20)) + 
+    theme_bw() + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(),
+          axis.line = element_line(colour = "black")) + 
+    theme(axis.text = element_text(size=12), axis.title = element_text(size=14))
+  return(p)
+}
+```
+
+```{r echo=FALSE}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+plots <- purrr::map(states, function(x) 
+  plot_crs_burden_vac_curve(x, crs_burden_dist=state_landscape_crs_burden_dist))
+pdf(file=file.path(FIGURES_FOLDER, "crs_burden_vac_curves.pdf"), w=8.5, h=11)
+plots_per_page <- 15
+groupings <- split(seq_along(plots), ceiling(seq_along(plots)/plots_per_page))
+for (ii in seq_along(groupings)) {
+  plots_subset <- plots[groupings[[ii]]]
+  num_plots_subset <- length(plots_subset)
+  if (num_plots_subset<plots_per_page) {
+    for (jj in 1:(plots_per_page-num_plots_subset)) {
+      plots_subset[[jj+num_plots_subset]] <- cowplot::ggdraw()
+    }
+  }
+  print(cowplot::plot_grid(plotlist=plots_subset, ncol=3))
+}
+a <- dev.off()
+```
+
+Let's plot the CRS burden landscape for each state. 
+
+```{r}
+# orgnize crs burden landscape data
+relative_crs_burden_landscape <- state_landscape_crs_burden_dist %>% 
+  group_by(state) %>% 
+  mutate(base_crs_burden=crs_burden[which(vac==0)]) %>% 
+  mutate(relative_crs_burden=crs_burden/base_crs_burden, 
+         vac=factor(vac, 0:100)) %>% 
+  mutate(state=ifelse(state=="Federal Capital Territory", 
+                      "FCT", state))
+state_order <- min_vac_cov_data %>% 
+  mutate(state=ifelse(state=="Federal Capital Territory", 
+                      "FCT", state)) %>% 
+  filter(metric=="median") %>% 
+  arrange(-desc(min_cov)) %>% 
+  pull(state)
+relative_crs_burden_landscape %<>% 
+  mutate(state=factor(state, levels=state_order))
+state_labels <- state_order
+focal_states <- c("Kano", "Zamfara", "Abia", "Cross River", "Gombe", "Oyo", "Kogi", "Nigeria", "Lagos", "Akwa Ibom")
+state_labels[which(!(state_labels %in% focal_states))] <- ""
+axis_text_colors <- rep("black", length(state_labels))
+axis_text_colors[which(state_labels=="Nigeria")] <- "red"
+crs_burden_landscape <- ggplot() + 
+  geom_tile(data=relative_crs_burden_landscape, 
+            mapping=aes(x=vac, y=state, fill=relative_crs_burden, color=relative_crs_burden)) + 
+  labs(x="Routine coverage") + 
+  scale_x_discrete(breaks=seq(0, 100, 25), labels=paste0(seq(0, 100, 25), "%"), expand=c(0, 0)) + 
+  scale_y_discrete(expand=c(0, 0), breaks=state_order, labels=state_labels) + 
+  scale_fill_gradientn(colours=rev(brewer.pal(11, "RdBu")), breaks=seq(0, 2, 0.5), 
+                       limits=c(0, 2), name="Relative\nburden") + 
+  scale_color_gradientn(colours=rev(brewer.pal(11, "RdBu")), breaks=seq(0, 2, 0.5), 
+                       limits=c(0, 2), guide="none") + 
+  guides(fill=guide_colorbar(title.position="top", title.hjust=0.5, 
+                             ticks.colour="black", frame.colour="black")) + 
+  theme_bw() + 
+  theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+        panel.background=element_blank(), panel.border=element_rect(colour="black")) + 
+  theme(axis.text.x = element_text(color="black", size=6),
+        axis.text.y = element_text(size=6, vjust=0.4, 
+                                   color=axis_text_colors), 
+        axis.title.x = element_text(color="black", size=6, hjust=0.5), 
+        axis.title.y=element_blank(), 
+        legend.title=element_blank(), 
+        legend.text=element_text(color="black", size=6)) + 
+  theme(legend.position="right", legend.key.size=unit(0.3, "cm"), legend.key.width=unit(0.4, "cm"), 
+        legend.key.height=unit(0.3, "cm"), 
+        legend.text=element_text(size=6), legend.title=element_text(size=6, hjust=0), 
+        legend.box.background=element_blank(), legend.background=element_blank(), 
+        legend.box.margin=margin(-10, -5, -10, -5), legend.margin=margin(0, 0, 0, 0)) + 
+  theme(plot.margin = unit(c(0.1, 0.3, 0.1, 0.1), "cm"))
+crs_burden_landscape
+```
+
+Finally, let's configure a summary plot for presentation. 
+
+```{r}
+states <- sort(unique(pull(ng2_pop, state)))
+p2 <- plot_min_cov_mcv1_diff_map(min_vac_cov_data=min_vac_cov_data, ng1_mcv1_data=ng1_mcv1_data, ng1=ng1)
+p1 <- plot_min_vac_cov_map(min_vac_cov_data=min_vac_cov_data, ng1=ng1)
+pABC <- cowplot::plot_grid(p1, p2, crs_burden_landscape, rel_widths=c(1, 1, 1.3), nrow=1,
+                           labels=c("(a)", "(b)", "(c)"), label_size=10, label_fontface="plain", label_fontfamily="serif")
+
+scale_factor <- 0.2
+pdf(file=file.path(FIGURES_FOLDER, "min_vac_cov_plot.pdf"), w=8.5, h=11*scale_factor)
+print(pABC)
+a <- dev.off()
+```
