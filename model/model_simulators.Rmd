@@ -1,0 +1,706 @@
+---
+title: "MSEIRV compartment model simulators"
+output:
+  html_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+knitr::knit_hooks$set(
+  margin1 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin2 = function(before, options, envir) {
+    if (before) par(mgp = c(2, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin3 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", mai = rep(.1, 4))
+    else NULL
+  }
+)
+
+knitr::opts_chunk$set(echo       = TRUE,
+                      margin1    = TRUE,
+                      fig.retina = 2,
+                      fig.align  = "center")
+```
+
+## Links to local data sets
+
+Here we use the following links to data.
+
+```{r}
+# directories 
+DATA_FOLDER <- file.path("..", "data")
+POPULATION_DATA_FOLDER <- file.path(DATA_FOLDER, "population_data")
+VACCINATION_DATA_FOLDER <- file.path(DATA_FOLDER, "vaccination_data")
+R0_ESTIMATION_FOLDER <- file.path("..", "R0_estimation")
+MCMC_ESTIMATES_FOLDER <- file.path(R0_ESTIMATION_FOLDER, "MCMC_estimates")
+PARAMETERS_FOLDER <- file.path("parameters")
+INITIAL_CONDITIONS_FOLDER <- file.path("initial_conditions")
+RCPP_FOLDER <- file.path("rcpp")
+
+# derived data from `nigeria_data_organization_exploration.Rmd`
+ng2_pop_path <- file.path(POPULATION_DATA_FOLDER, "ng2_pop.rds")
+
+# estimates from `R0_estimation.Rmd`
+r0_estimates_path <- file.path(MCMC_ESTIMATES_FOLDER,
+                               "MCMC_piecewise_lambda_fit_R0_estimates.rds")
+r0_estimates_country_path <- file.path(MCMC_ESTIMATES_FOLDER,
+                               "ng0_MCMC_piecewise_lambda_fit_R0_estimates.rds")
+
+# initial conditions from `initial_conditions.Rmd` and `parameterization.Rmd`
+initial_conditions_path <- file.path(INITIAL_CONDITIONS_FOLDER, "initial_conditions_list.rds")
+initial_age_distribution_path <- file.path(INITIAL_CONDITIONS_FOLDER, "initial_age_distribution_list.rds")
+initial_conditions_country_path <- file.path(INITIAL_CONDITIONS_FOLDER, "initial_conditions_country.rds")
+initial_age_distribution_country_path <- file.path(INITIAL_CONDITIONS_FOLDER, "initial_age_distribution_country.rds")
+
+# local data 
+ng1_mcv1_data_path <- file.path(VACCINATION_DATA_FOLDER, "ng1_mcv1_data.xlsx")
+general_sia_scenario1_path <- file.path(VACCINATION_DATA_FOLDER, "summarised_general_sia_scenario1.xlsx")
+general_sia_scenario2_path <- file.path(VACCINATION_DATA_FOLDER, "summarised_general_sia_scenario2.xlsx")
+```
+
+These are the paths we use for the simulation output. 
+
+```{r}
+ALL_OUTPUT_FOLDER <- "~/Desktop/output/"
+VALIDATION_SIMS_FOLDER <- file.path(ALL_OUTPUT_FOLDER, "validation_simulations", "raw_simulations")
+STATIC_RISK_SIMS_FOLDER <- file.path(ALL_OUTPUT_FOLDER, "static_risk_simulations", "raw_simulations")
+LANDSCAPE_SIMS_FOLDER <- file.path(ALL_OUTPUT_FOLDER, "static_risk_simulations", "landscape_simulations")
+DYNAMIC_RISK_SIMS_FOLDER <- file.path(ALL_OUTPUT_FOLDER, "dynamic_risk_simulations", "raw_simulations")
+SUMMARY_STATIC_SIMS_FOLDER <- file.path(ALL_OUTPUT_FOLDER, "static_risk_simulations", "summary_simulations")
+SUMMARY_DYNAMIC_SIMS_FOLDER <- file.path(ALL_OUTPUT_FOLDER, "dynamic_risk_simulations", "summary_simulations")
+```
+
+Change them accordingly if you want to run the script locally on your computer.
+
+## Preambule
+
+This document runs simulations of the MSEIRV age-structured model. The model itself is implemented in Cpp (`mspeirv_ode_model.cpp`). The following R Markdown documents must be successfully run prior to this document: `nigeria_data_organization_exploration.Rmd`, `R0_estimation.Rmd`, `initial_conditions.Rmd` and `parameterization.Rmd`. The vaccination data (`ng1_mcv1_data.xlsx`, `summarised_general_sia_scenario1.xlsx` and `summarised_general_sia_scenario2.xlsx`) are provided in the Github repository. 
+
+## Packages
+
+The needed packages:
+
+```{r message = FALSE}
+library(magrittr)
+library(tidyverse)
+library(Rcpp)
+library(microbenchmark)
+library(readxl)
+library(nloptr)
+```
+
+## Rcpp code
+
+Here, we compile the rcpp code that we need to run the simulation model. Details on the MSEIRV compartment model are provided in the supplementary text. 
+
+```{r}
+sourceCpp(file.path(RCPP_FOLDER, "mspeirv_ode_model.cpp"))
+```
+
+## Data
+
+### Nigeria demographic data
+
+Here, we read in some basic demographic data (age-structure/gender split) at the local government level in Nigeria (see `nigeria_data_organization_exploration.Rmd` for details on how the data was collected).
+
+```{r}
+ng2_pop <- readRDS(ng2_pop_path)
+```
+
+### Parameter/Initial conditions data 
+
+Here, we read in all the parameter and initial conditions data that is required for the simulations. 
+
+```{r}
+# initial conditions data
+initial_conditions <- readRDS(initial_conditions_path)
+initial_conditions[["Nigeria"]] <- readRDS(initial_conditions_country_path)
+
+# initial age distribution data
+initial_age_distributions <- readRDS(initial_age_distribution_path)
+initial_age_distributions[["Nigeria"]] <- readRDS(initial_age_distribution_country_path)
+
+# parameter data
+states <- sort(unique(pull(ng2_pop, state)))
+basic_parameters_list <- list()
+beta_matrices_list <- list()
+omegas_list <- list()
+for (this_state in states) {
+  basic_parameters_list[[this_state]] <- readRDS(file=file.path(PARAMETERS_FOLDER, this_state, "basic_parameters.rds"))
+  beta_matrices_list[[this_state]] <- readRDS(file=file.path(PARAMETERS_FOLDER, this_state, "beta_matrices.rds"))
+  omegas_list[[this_state]] <- readRDS(file=file.path(PARAMETERS_FOLDER, this_state, "omegas.rds"))
+}
+basic_parameters_list[["Nigeria"]] <- readRDS(file=file.path(PARAMETERS_FOLDER, "Nigeria", "basic_parameters.rds"))
+beta_matrices_list[["Nigeria"]] <- readRDS(file=file.path(PARAMETERS_FOLDER, "Nigeria", "beta_matrices.rds"))
+omegas_list[["Nigeria"]] <- readRDS(file=file.path(PARAMETERS_FOLDER, "Nigeria", "omegas.rds"))                                   
+
+# R0 estimation data
+r0_estimates <- readRDS(r0_estimates_path)
+r0_estimates_country <- readRDS(r0_estimates_country_path)
+```
+
+### Vaccination data
+
+Here, we read in the state-level MCV1 coverage data for Nigeria and general supplemental immunization scenarios. 
+
+```{r}
+ng1_mcv1_data <- readxl::read_excel(ng1_mcv1_data_path) %>% 
+  rbind(., data.frame(state="Nigeria", MCV1=54.0))
+general_sia_scenarios <- list("sia1"=readxl::read_excel(path=general_sia_scenario1_path, na="NA"), 
+                              "sia2"=readxl::read_excel(path=general_sia_scenario2_path, na="NA"))
+```
+
+## Helper functions
+
+`reorder_initial_conditions` takes a named vector of initial conditions, the number of stages and the order of the classes, and then returns the initial conditions vector according to the specified orders. This is necessary for the Rcpp code. 
+```{r}
+reorder_initial_conditions <- function(initial_conditions, num_stages,  
+                                       class_order=c("M", "S", "E", "I", "R", "V", "1SP", "2SP", "3SP", "EP")) {
+  reordered_initial_conditions <- c()
+  for (ii in class_order) {
+    reordered_initial_conditions <- c(reordered_initial_conditions, 
+                                      initial_conditions[paste(ii, 1:num_stages, sep="")])
+  }
+  return(reordered_initial_conditions)
+}
+```
+
+## Static risk assessment simulations
+
+Next, we generate the simulations necessary for static risk assessment in each of the states. 
+
+Here, we construct a function `mseir_static_risk_sim` which takes as arguments a state, `this_state`, a time frame (in years) `tf`, `sim_type` (0 for without routine coverage and 1 for with routine coverage), the proportion of children immunized during routine coverage `routine_cov`and the simulation number (this is relevant for the uncertainty analysis), the external immigration rate and returns a data frame with the results of the deterministic ODE simulation. When `simplified_output` is `TRUE`, only the time series of the exposed-and-pregnant compartments are returned (otherwise all the simulation results are returned). 
+
+```{r}
+mseirv_static_sim  <- function(this_state, tf, sim_type, routine_cov, sim_num, ext_immi_rate, simplified_output=FALSE) {
+  # get parameters
+  basic_parameters <- basic_parameters_list[[this_state]]
+  beta_matrix <- beta_matrices_list[[this_state]][[sim_num]]
+  omega <- omegas_list[[this_state]][sim_num]
+  
+  omegas <- rep(omega, basic_parameters$num_stages)
+  names(omegas) <- paste0("omega", 1:basic_parameters$num_stages, sep="")
+  basic_parameters$beta <- beta_matrix
+  basic_parameters$omega <- omegas
+  parameters <- unlist(basic_parameters)
+  names(parameters) <- gsub("^.*\\.","", names(parameters))
+  parameters <- c(parameters, sim_type=sim_type, eps=ext_immi_rate)
+  if (sim_type==1) {
+    pv <- rep(routine_cov, tf) 
+    names(pv) <- paste("pv", 1:tf, sep="")
+    parameters <- c(parameters, pv)
+  } else if (sim_type==2) {
+    pv <- routine_cov
+    names(pv) <- paste("pv", 1:(tf), sep="")
+    parameters <- c(parameters, pv) 
+  } 
+  
+  # get initial conditions
+  initial_conditions <- initial_conditions[[this_state]]
+  initial_conditions <- reorder_initial_conditions(initial_conditions, 
+                                                   num_stages=parameters["num_stages"])
+  classes <- c("M", "S", "E", "I", "R", "V", "1SP", "2SP", "3SP", "EP")
+  initial_pop <- sapply(1:(length(initial_conditions)/length(classes)), function(x) sum(initial_conditions[paste0(classes, x)]))
+  names(initial_pop) <- paste0("N", 1:length(initial_pop))
+  parameters <- c(parameters, initial_pop)
+  
+  output <- deSolve::ode(y=initial_conditions, times=seq(0, tf*365-1, 1), func=get_ode_rates, parms=parameters, 
+                         maxsteps=10^4, method="rk4") %>%
+    as.data.frame()
+  if (simplified_output) {
+    output <- output[, c("time", paste("EP", 1:parameters["num_stages"], sep=""))]
+  }
+  return(output)
+}
+```
+
+### No vaccination 
+
+Let's run 30 years of simulations without any routine vaccination. Note: `sim_type=0` denotes simulations with no interventions. 
+
+```{r}
+no_vac_simulator <- function(this_state, sim_num) {
+  tf <- 30
+  ext_immi_rate <- 10/10^5/365 # 10 infected immigrant per 100,000 individuals per year
+  output <- mseirv_static_sim(this_state=this_state, tf=tf, sim_type=0, sim_num=sim_num, 
+                              ext_immi_rate=ext_immi_rate, simplified_output=TRUE)
+  file_name <- paste(this_state, paste0("tf", tf), "noVac", paste0("simNum", sim_num), sep="_")
+  saveRDS(output, file=file.path(STATIC_RISK_SIMS_FOLDER, file_name))
+}
+```
+
+State level simulations...
+
+```{r results="hide", eval=FALSE}
+states <- unique(pull(ng2_pop, state))
+sim_nums <- 1:200
+input <- expand.grid(state=states, sim_num=sim_nums)
+(parallel::mcmapply(no_vac_simulator, as.character(input[["state"]]), input[["sim_num"]], mc.cores=6))
+```
+NOTE: Full results (i.e. `simplified_output=FALSE`) are required for `sim_num=1`. 
+
+National level simulations...
+
+```{r results="hide", eval=FALSE}
+sim_nums <- 1:200
+input <- expand.grid(state="Nigeria", sim_num=sim_nums)
+(parallel::mcmapply(no_vac_simulator, as.character(input[["state"]]), input[["sim_num"]], mc.cores=5))
+```
+NOTE: Full results (i.e. `simplified_output=FALSE`) are required for `sim_num=1`
+
+### Vaccination at current MCV1 coverage 
+
+Let's run 30 years of simulations with routine vaccination set to current MCV1 coverage. Note: `sim_type=1` denotes simulations with routine vaccination (no change in coverage over time). 
+
+```{r}
+vac_simulator <- function(this_state, sim_num) {
+  tf <- 30
+  routine_cov <- as.numeric(ng1_mcv1_data[which(ng1_mcv1_data$state==this_state), "MCV1"])
+  ext_immi_rate <- 10/10^5/365 # 10 infected immigrant per 100,000 individuals per year
+  output <- mseirv_static_sim(this_state=this_state, tf=tf, sim_type=1, sim_num=sim_num, 
+                              routine_cov=routine_cov/100, ext_immi_rate=ext_immi_rate, simplified_output=TRUE)
+  file_name <- paste(this_state, paste0("tf", tf), "vac", paste0("simNum", sim_num), sep="_")
+  saveRDS(output, file=file.path(STATIC_RISK_SIMS_FOLDER, file_name))
+}
+```
+
+State level simulations...
+
+```{r results="hide", eval=FALSE}
+states <- unique(pull(ng2_pop, state))
+sim_nums <- 1:200
+input <- expand.grid(state=states, sim_num=sim_nums)
+(parallel::mcmapply(vac_simulator, as.character(input[["state"]]), input[["sim_num"]], mc.cores=5))
+```
+
+National level simulations...
+
+```{r results="hide", eval=FALSE}
+sim_nums <- 1:200
+input <- expand.grid(state="Nigeria", sim_num=sim_nums)
+(parallel::mcmapply(vac_simulator, as.character(input[["state"]]), input[["sim_num"]], mc.cores=5))
+```
+
+### Minimum necessary vaccination coverage 
+
+Next, we perform some optimization to estimate the minimum routine vaccination coverage necessary to prevent an increase in 30-year CRS burden relative to pre-vaccination burden. We start by defining some functions that are necessary for the optimization procedure. First, we define a function that takes a simulation output and computes the 30-year CRS burden. 
+
+```{r}
+compute_crs_burden <- function(sim, sim0, params) {
+  # compute crs incidence
+  EP <- sim[, paste("EP", 1:params$num_stages, sep="")] %>% as.data.frame()
+  sigma <- params$sigma
+  c <- 0.65
+  crs_incidence <- apply(EP, 1, function(x) sum(c*x*sigma))
+  
+  # compute births
+  aN <- sapply(1:params$num_stages, function(x) rowSums(sim0[, 1+seq(x, ncol(sim0)-1, params$num_stages)]))
+  initN <- aN[1, ]
+  total_initN <- sum(initN)
+  births <- rowSums(t(sapply(1:nrow(aN), function(x) aN[x, ]*initN/aN[x, ]*params$f*(1+params$db)^x)))
+  
+  # compute long-term CRS burden
+  crs_burden <- sum(crs_incidence)/sum(births)*10^5
+  
+  return(crs_burden)
+}
+```
+
+Next, we define the objective function and constraints of the optimization problem.
+
+```{r}
+# objective function
+eval_f0 <- function(x, this_state, this_sim_num) {
+  return(x)
+}
+
+# constraints 
+eval_g0 <- function(x, this_state, this_sim_num) {
+  basic_parameters <- basic_parameters_list[[this_state]]
+  
+  output0 <- readRDS(file.path(STATIC_RISK_SIMS_FOLDER, paste(this_state, "tf30", "noVac", 
+                                                              paste0("simNum", this_sim_num), sep="_")))
+  f0 <- compute_crs_burden(output0, output0, basic_parameters)
+  
+  outputV <- mseirv_static_sim(this_state=this_state, tf=30, sim_type=1, sim_num=this_sim_num, 
+                               ext_immi_rate = 10/10^5/365, 
+                               routine_cov=x, simplified_output=TRUE)
+  fv <- compute_crs_burden(outputV, output0, basic_parameters)
+  
+  alpha <- 0.01
+  return(fv-f0-alpha)
+}
+```
+
+**State level analyses** \newline
+
+Since we don't have the computational infrastructure to perform uncertainty analyses, we focus on finding the minimum necessary vaccination coverage at the median $R_0$ and the bounds of the $90\%$ credible interval estimated from the serological survey data. Here, we find the parameters that correspond to the median $R_0$ and the bounds of the $90\%$ credible interval for each state. 
+
+```{r}
+states <- sort(unique(pull(ng2_pop, state)))
+state_median_r0_idxs <- rep(NA, length(states))
+state_median_r0s <- rep(NA, length(states))
+state_l90_r0_idxs <- rep(NA, length(states))
+state_l90_r0s <- rep(NA, length(states))
+state_u90_r0_idxs <- rep(NA, length(states))
+state_u90_r0s <- rep(NA, length(states))
+for (ii in seq_along(states)) {
+  state_r0_estimates <- r0_estimates[, states[ii]]
+  state_median_r0s[ii] <- sort(state_r0_estimates)[floor(length(state_r0_estimates)*0.5)]
+  state_median_r0_idxs[ii] <- which(state_r0_estimates==sort(state_r0_estimates)[floor(length(state_r0_estimates)*0.5)])
+  state_l90_r0s[ii] <- sort(state_r0_estimates)[floor(length(state_r0_estimates)*0.05)]
+  state_l90_r0_idxs[ii] <- which(state_r0_estimates==sort(state_r0_estimates)[floor(length(state_r0_estimates)*0.05)])
+  state_u90_r0s[ii] <- sort(state_r0_estimates)[floor(length(state_r0_estimates)*0.95)]
+  state_u90_r0_idxs[ii] <- which(state_r0_estimates==sort(state_r0_estimates)[floor(length(state_r0_estimates)*0.95)])
+}
+names(state_median_r0_idxs) <- states
+names(state_median_r0s) <- states
+names(state_l90_r0_idxs) <- states
+names(state_l90_r0s) <- states
+names(state_u90_r0_idxs) <- states
+names(state_u90_r0s) <- states
+```
+
+We need to perform run the simulations for the no vaccination scenario for the selected indices. Full results (i.e. `simplified_output=FALSE`) are required for these simulations. 
+
+```{r eval=FALSE}
+median_input <- data.frame(state=names(state_median_r0_idxs), 
+                           sim_num=state_median_r0_idxs)
+(parallel::mcmapply(no_vac_simulator, as.character(median_input[["state"]]), median_input[["sim_num"]], mc.cores=5))
+
+l90_input <- data.frame(state=names(state_l90_r0_idxs), 
+                        sim_num=state_l90_r0_idxs)
+(parallel::mcmapply(no_vac_simulator, as.character(l90_input[["state"]]), l90_input[["sim_num"]], mc.cores=5))
+
+u90_input <- data.frame(state=names(state_u90_r0_idxs), 
+                        sim_num=state_u90_r0_idxs)
+(parallel::mcmapply(no_vac_simulator, as.character(u90_input[["state"]]), u90_input[["sim_num"]], mc.cores=5))
+```
+
+Finally, let's perform the optimization. 
+
+```{r results="hide", eval=FALSE}
+# define the initial conditions
+x0s <- rep(0.9, length(unique(pull(ng2_pop, state))))
+names(x0s) <- sort(unique(pull(ng2_pop, state)))
+
+# perform the optimization for each state
+optimization_output_list <- list()
+states <- sort(unique(pull(ng2_pop, state)))
+r0_idxs_list <- list(state_median_r0_idxs, state_l90_r0_idxs, state_u90_r0_idxs)
+r0s_list <- list(state_median_r0s, state_l90_r0s, state_u90_r0s)
+file_name_prefix <- c("median", "l90", "u90")
+for (jj in 1:length(r0_idxs_list)) {
+  state_r0_idxs <- r0_idxs_list[[jj]]
+  state_r0s <- r0s_list[[jj]]
+  for (ii in states) {
+    result <- nloptr(x0 = x0s[ii], 
+                     eval_f = eval_f0,
+                     lb = c(0),
+                     ub = c(1), 
+                     eval_g_ineq = eval_g0,
+                     opts = list("algorithm"="NLOPT_LN_COBYLA",
+                                 "xtol_rel"=0.001),
+                     this_state=ii, this_sim_num=state_r0_idxs[ii])
+    print(result)
+    optimization_output_list[[ii]] <- result
+  }
+  saveRDS(optimization_output_list, file=file.path(SUMMARY_STATIC_SIMS_FOLDER, 
+                                                   paste0(file_name_prefix[jj], "_r0_min_cov_optimization_output.rds")))
+  saveRDS(state_r0_idxs, file=file.path(SUMMARY_STATIC_SIMS_FOLDER, 
+                                        paste0(file_name_prefix[jj], "_r0_simNums_optimization.rds")))
+  saveRDS(state_r0s, file=file.path(SUMMARY_STATIC_SIMS_FOLDER, 
+                                    paste0(file_name_prefix[jj], "_r0_optimization.rds")))
+}
+```
+
+**National level analyses** \newline
+
+```{r}
+median_r0 <- sort(r0_estimates_country)[floor(length(r0_estimates_country)*0.5)]
+median_r0_idx <- which(r0_estimates_country==sort(r0_estimates_country)[floor(length(r0_estimates_country)*0.5)])
+l90_r0 <- sort(r0_estimates_country)[floor(length(r0_estimates_country)*0.05)]
+l90_r0_idx <- which(r0_estimates_country==sort(r0_estimates_country)[floor(length(r0_estimates_country)*0.05)])
+u90_r0 <- sort(r0_estimates_country)[floor(length(r0_estimates_country)*0.95)]
+u90_r0_idx <- which(r0_estimates_country==sort(r0_estimates_country)[floor(length(r0_estimates_country)*0.95)])
+```
+
+```{r eval=FALSE}
+input <- data.frame(state="Nigeria", 
+                    sim_num=c(median_r0_idx, l90_r0_idx, u90_r0_idx))
+(parallel::mcmapply(no_vac_simulator, as.character(input[["state"]]), input[["sim_num"]], mc.cores=3))
+```
+
+```{eval=FALSE, results="hide"}
+statistics <- c("median", "l90", "u90")
+r0s <- c(median_r0, l90_r0, u90_r0)
+names(r0s) <- statistics
+r0_idxs <- c(median_r0_idx, l90_r0_idx, u90_r0_idx)
+names(r0_idxs) <- statistics
+optimization_output_list <- list()
+for (jj in 1:length(statistics)) {
+  r0 <- r0s[jj]
+  r0_idx <- r0_idxs[jj]
+  result <- nloptr(x0 = 0.9, 
+                   eval_f = eval_f0,
+                   lb = c(0),
+                   ub = c(1), 
+                   eval_g_ineq = eval_g0,
+                   opts = list("algorithm"="NLOPT_LN_COBYLA",
+                               "xtol_rel"=0.001),
+                   this_state="Nigeria", this_sim_num=r0_idx)
+  print(result)
+  optimization_output_list[[jj]] <- result
+}
+saveRDS(optimization_output_list, file=file.path(SUMMARY_STATIC_SIMS_FOLDER, 
+                                                 "ng0_r0_min_cov_optimization_output.rds"))
+saveRDS(r0_idxs, file=file.path(SUMMARY_STATIC_SIMS_FOLDER, 
+                                "ng0_r0_simNums_optimization.rds"))
+saveRDS(r0s, file=file.path(SUMMARY_STATIC_SIMS_FOLDER, 
+                            "ng0_r0_optimization.rds"))
+```
+
+### CRS burden landscape
+
+First, we also compute the landscape for each individual state at its median $R_0$. 
+
+Next, we perform the simulations. 
+
+```{r}
+landscape_simulator <- function(this_state, routine_cov, sim_num) {
+  tf <- 30
+  ext_immi_rate <- 10/10^5/365 # 10 infected immigrant per 100,000 individuals per year
+  output <- mseirv_static_sim(this_state=this_state, tf=tf, sim_type=1, sim_num=sim_num, 
+                              routine_cov=routine_cov/100, ext_immi_rate=ext_immi_rate, simplified_output=TRUE)
+  file_name <- paste(this_state, paste0("tf", tf), paste0("cov", routine_cov), paste0("simNum", sim_num), sep="_")
+  saveRDS(output, file=file.path(LANDSCAPE_SIMS_FOLDER, file_name))
+}
+```
+
+At the state level...
+
+```{r eval=FALSE}
+routine_covs <- seq(0, 100, 1) 
+input <- data.frame(state=names(state_median_r0_idxs), sim_num=state_median_r0_idxs)
+input <- merge(data.frame(routine_cov=routine_covs), input, by=NULL)
+(parallel::mcmapply(landscape_simulator, as.character(input[["state"]]), input[["routine_cov"]], input[["sim_num"]], mc.cores=5))
+```
+
+At the national level...
+
+```{r eval=FALSE}
+routine_covs <- seq(0, 100, 1) 
+input <- data.frame(state="Nigeria", sim_num=median_r0_idx)
+input <- merge(data.frame(routine_cov=routine_covs), input, by=NULL)
+(parallel::mcmapply(landscape_simulator, as.character(input[["state"]]), input[["routine_cov"]], input[["sim_num"]], mc.cores=1))
+```
+
+## Dynamic risk assessment simulations
+
+Next, we run simulations where the routine vaccination coverage is allowed to change over time and where supplemental immunization campaigns are conducted among children after introduction. 
+
+### Improvement in routine vaccination coverage 
+
+We start by making a simple adjustment to the previous simulations. We introduce routine vaccination at the current MCV1 coverage level and then allow the RCV coverage to increase over time. In particular, each year the proportion missed during routine vaccination is decreased by some percentage. We define improvement in this way to reflect the fact that absolute increases in routine coverage become more difficult as routine RCV coverage increases. 
+
+We focus on four scenarios: $1\%$, $2.5\%$, $5\%$ and $10\%$. Let's run simulations for these scenarios. We let `sim_type=2` to reflect the fact that routine RCV coverage improves over time. 
+
+```{r}
+basic_dynamic_simulator <- function(this_state, sim_num, rate) {
+  tf <- 30
+  ext_immi_rate <- 10/10^5/365 # 10 infected immigrant per 100,000 individuals per year
+  routine_cov <- as.numeric(ng1_mcv1_data[which(ng1_mcv1_data$state==this_state), "MCV1"])
+  routine_covs <- rep(NA, tf)
+  for (ii in seq_along(routine_covs)) {
+    if (ii==1) routine_covs[ii] <- routine_cov
+    else routine_covs[ii] <- (100-routine_covs[ii-1])*rate+routine_covs[ii-1]
+  }
+  output <- mseirv_static_sim(this_state=this_state, tf=tf, sim_type=2, sim_num=sim_num, ext_immi_rate=ext_immi_rate, 
+                              routine_cov=routine_covs/100, simplified_output=TRUE)
+  file_name <- paste(this_state, paste0("tf", tf), paste0("vacRate", rate*1000), paste0("simNum", sim_num), sep="_")
+  saveRDS(output, file=file.path(DYNAMIC_RISK_SIMS_FOLDER, file_name))
+}
+```
+
+Let's run the simulations...
+```{r eval=FALSE}
+states <- c(unique(pull(ng2_pop, state)), "Nigeria")
+sim_nums <- 1:100
+rates <- c(0.01, 0.025, 0.05, 0.1)
+input <- expand.grid(state=states, sim_num=sim_nums, rate=rates)
+(parallel::mcmapply(basic_dynamic_simulator, as.character(input[["state"]]), input[["sim_num"]], input[["rate"]], mc.cores=6))
+```
+
+Let's run some additional simulations for each state at the median $R_0$. 
+
+```{r eval=FALSE}
+rates <- c(0, 0.01, 0.025, 0.05, 0.1)
+input <- data.frame(state=rep(c(names(state_median_r0_idxs), "Nigeria"), each=length(rates)),
+                    sim_num=rep(c(state_median_r0_idxs, median_r0_idx), each=length(rates)), 
+                    rate=rep(rates, length(state_median_r0_idxs)+1))
+(parallel::mcmapply(basic_dynamic_simulator, as.character(input[["state"]]), input[["sim_num"]], input[["rate"]], mc.cores=2))
+```
+
+### Improvement in routine vaccination coverage with SIAs
+
+Next, we add two additional layers to the vaccination program: (1) a starting ('catch-up') campaign in the first year of vaccination targeting children aged 1 year to 14 years and (2) the same starting campaign along with regular supplemental immunization activities (`follow-up campaigns`) targeting all children aged between 1 year and 4 years at 4-year intervals. Since we now include SIAs, there are additional steps that the simulator must take. `sim_type=3` refers to the full dynamic simulations with changes in routine vaccination, SIAs, and imported infections. 
+
+`mseirv_dynamic_sim` is similar to `mseirv_static_sim` except that it includes a program of supplemental immunisation campaigns defined by `sia_data`. It also only permits `sim_type=3`. 
+
+```{r}
+mseirv_dynamic_sim  <- function(this_state, tf, sim_num, routine_cov, sia_data, ext_immi_rate, simplified_output=FALSE) {
+  # get parameters
+  basic_parameters <- basic_parameters_list[[this_state]]
+  beta_matrix <- beta_matrices_list[[this_state]][[sim_num]]
+  omega <- omegas_list[[this_state]][sim_num]
+  
+  omegas <- rep(omega, basic_parameters$num_stages)
+  names(omegas) <- paste0("omega", 1:basic_parameters$num_stages, sep="")
+  basic_parameters$beta <- beta_matrix
+  basic_parameters$omega <- omegas
+  parameters <- unlist(basic_parameters)
+  names(parameters) <- gsub("^.*\\.","", names(parameters))
+  parameters <- c(parameters, sim_type=3)
+  
+  # add routine vaccination to parameters
+  pv <- routine_cov; names(pv) <- paste("pv", 1:tf, sep=""); parameters <- c(parameters, pv) 
+  
+  # add infected immigration rate
+  parameters <- c(parameters, eps=ext_immi_rate)
+  
+  # get initial conditions
+  initial_conditions <- initial_conditions[[this_state]]
+  initial_conditions <- reorder_initial_conditions(initial_conditions, 
+                                                   num_stages=parameters["num_stages"])
+  classes <- c("M", "S", "E", "I", "R", "V", "1SP", "2SP", "3SP", "EP")
+  initial_pop <- sapply(1:(length(initial_conditions)/length(classes)), function(x) sum(initial_conditions[paste0(classes, x)]))
+  names(initial_pop) <- paste0("N", 1:length(initial_pop))
+  parameters <- c(parameters, initial_pop)
+  
+  # organize SIA data
+  initial_age_distribution <- initial_age_distributions[[this_state]]
+  agegrps <- initial_age_distribution$agegrp
+  sia_data %<>% 
+    mutate(lAgeIdx=sapply(lAge, function(x) which(agegrps==x)), 
+           uAgeIdx=sapply(uAge, function(x) which(agegrps==x)-1))
+  sia_start_years <- pull(sia_data, year)
+
+  # no SIAs
+  if (length(sia_start_years)==0) {
+    output <- as.data.frame(deSolve::ode(y=initial_conditions, 
+                                         times=seq(0, tf*365, 1),
+                                         func=get_ode_rates, parms=parameters, maxsteps=10^4))
+    if (simplified_output) {
+      output <- output[, c("time", paste("EP", 1:parameters["num_stages"], sep=""))]
+    }
+    return(output)
+  }
+  
+  # has SIAs
+  for (ii in seq_along(sia_start_years)) {
+    if (ii==1 && sia_start_years[ii]!=1) {
+      output <- as.data.frame(deSolve::ode(y=initial_conditions, 
+                                           times=seq(0, (sia_start_years[ii]-1)*365-1, 1),
+                                           func=get_ode_rates, parms=parameters, maxsteps=10^4))
+      initial_conditions <- output[, -1] %>% tail(1)
+      state_names <- names(initial_conditions)
+      initial_conditions <- as.numeric(initial_conditions)
+      names(initial_conditions) <- state_names
+    }
+    
+    initial_conditions <- conduct_sia(y=initial_conditions,
+                                      st_agegrp_idx=as.numeric(sia_data[ii, "lAgeIdx"]),
+                                      end_agegrp_idx=as.numeric(sia_data[ii, "uAgeIdx"]),
+                                      cov=as.numeric(sia_data[ii, "cov"]/100))
+    start_time <- (sia_start_years[ii]-1)*365
+    if (ii==length(sia_start_years)) end_time <- tf*365-1
+    else end_time <- (sia_start_years[ii+1]-1)*365-1
+    section_output <- as.data.frame(deSolve::ode(y=initial_conditions, 
+                                                 times=seq(start_time, end_time, 1), 
+                                                 func=get_ode_rates, parms=parameters, maxsteps=10^4))
+    if (ii==1 && sia_start_years[ii]==1) output <- section_output
+    else output <- rbind(output, section_output)
+    
+    initial_conditions <- output[, -1] %>% tail(1)
+    state_names <- names(initial_conditions)
+    initial_conditions <- as.numeric(initial_conditions)
+    names(initial_conditions) <- state_names
+  }
+  if (simplified_output) {
+    output <- output[, c("time", paste("EP", 1:parameters["num_stages"], sep=""))]
+  }
+  return(output)
+}
+```
+
+Next, let's run the simulations. `advanced_dynamic_simulator` takes as arguments a state name `this_state`, a simulation number `sim_num`, a starting routine coverage (optional) `custom_routine_cov`, a rate of improvement `rate`, a program of SIAs `sia_type` and logical flags for the handling of the simulation output.  
+
+```{r}
+advanced_dynamic_simulator <- function(this_state, sim_num, custom_routine_cov=NULL, rate, sia_type, return_output=FALSE, save_output=TRUE, overwrite=FALSE) {
+  tf <- 30
+  ext_immi_rate <- 10/10^5/365 # 10 infected immigrant per 100,000 individuals per year
+  
+  # routine vaccination
+  if (is.null(custom_routine_cov)) {
+    routine_cov <- as.numeric(ng1_mcv1_data[which(ng1_mcv1_data$state==this_state), "MCV1"])
+  } else {
+    routine_cov <- custom_routine_cov
+  }
+  routine_covs <- rep(NA, tf)
+  for (ii in seq_along(routine_covs)) {
+    if (ii==1) routine_covs[ii] <- routine_cov
+    else routine_covs[ii] <- (100-routine_covs[ii-1])*rate+routine_covs[ii-1]
+  }
+  
+  # supplemental immunization activities (SIAs)
+  general_sia_scenario <- general_sia_scenarios[[sia_type]]
+  rcv_sias <- general_sia_scenario %>% 
+    select(Year, SIA, Coverage, `Lower Age`, `Upper Age`) %>% 
+    filter(SIA=="Yes") %>% 
+    select(-SIA) %>% 
+    transmute(year=as.numeric(Year), cov=as.numeric(Coverage), 
+              lAge=as.numeric(`Lower Age`), uAge=as.numeric(`Upper Age`))
+  
+  if (!overwrite) {
+    file_name <- paste(this_state, paste0("tf", tf), sia_type, paste0("vacRate", rate*1000), paste0("simNum", sim_num), sep="_")
+    file <- file.path(DYNAMIC_RISK_SIMS_FOLDER, file_name)
+    if (file.exists(file)) return()
+  }
+  output <- mseirv_dynamic_sim(this_state=this_state, tf=tf, sim_num=sim_num,
+                               routine_cov=routine_covs/100, sia_data=rcv_sias, ext_immi_rate=ext_immi_rate, 
+                               simplified_output=TRUE)
+  if (save_output) {
+    file_name <- paste(this_state, paste0("tf", tf), sia_type, paste0("vacRate", rate*1000), paste0("simNum", sim_num), sep="_")
+    saveRDS(output, file=file.path(DYNAMIC_RISK_SIMS_FOLDER, file_name))
+  }
+  if (return_output) return(output)
+}
+```
+
+```{r eval=FALSE}
+states <- c(unique(pull(ng2_pop, state)), "Nigeria")
+sim_nums <- 1:100
+rates <- c(0, 0.01, 0.025, 0.05, 0.1)
+sia_types <- c("sia1", "sia2")
+input <- expand.grid(state=states, sim_num=sim_nums, rate=rates, sia_type=sia_types)
+(parallel::mcmapply(advanced_dynamic_simulator, as.character(input[["state"]]), input[["sim_num"]], input[["rate"]], input[["sia_type"]], mc.cores=5))
+```
+
+Let's run some additional simulations for each state at the median $R_0$. 
+
+```{r eval=FALSE}
+rates <- c(0, 0.01, 0.025, 0.05, 0.1)
+sia_types <- c("sia1", "sia2")
+input <- data.frame(state=rep(c(names(state_median_r0_idxs), "Nigeria"), each=length(rates)),
+                    sim_num=rep(c(state_median_r0_idxs, median_r0_idx), each=length(rates)), 
+                    rate=rep(rates, length(state_median_r0_idxs)+1), 
+                    sia_type=rep(sia_types, each=(length(state_median_r0_idxs)+1)*length(rates)))
+(parallel::mcmapply(advanced_dynamic_simulator, as.character(input[["state"]]), input[["sim_num"]], input[["rate"]], input[["sia_type"]], mc.cores=5))
+```
