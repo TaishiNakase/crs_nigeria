@@ -1,0 +1,178 @@
+---
+title: "Initialization of dynamic rubella models"
+output:
+  html_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+knitr::knit_hooks$set(
+  margin1 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin2 = function(before, options, envir) {
+    if (before) par(mgp = c(2, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin3 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", mai = rep(.1, 4))
+    else NULL
+  }
+)
+
+knitr::opts_chunk$set(echo       = TRUE,
+                      margin1    = TRUE,
+                      fig.retina = 2,
+                      fig.align  = "center")
+```
+
+## Links to local data sets
+
+Here we use the following links to data.
+
+```{r}
+DATA_FOLDER <- file.path("..", "data")
+POPULATION_DATA_FOLDER <- file.path(DATA_FOLDER, "population_data")
+R0_ESTIMATION_FOLDER <- file.path("..", "R0_estimation")
+MCMC_ESTIMATES_FOLDER <- file.path(R0_ESTIMATION_FOLDER, "MCMC_estimates")
+PARAMETERS_FOLDER <- file.path("parameters")
+INITIAL_CONDITIONS_FOLDER <- file.path("initial_conditions")
+
+ng2_pop_path <- file.path(POPULATION_DATA_FOLDER, "ng2_pop.rds")
+ng0_pop_path <- file.path(POPULATION_DATA_FOLDER, "ng0_pop.rds")
+```
+
+Change them accordingly if you want to run the script locally on your computer.
+
+## Preambule
+
+This document generates the initial conditions for the MSEIRV age-structured model used for the rubella simulations in each of the thirty-seven states and at the national level. The R Markdown document `nigeria_data_organization_exploration.Rmd` must be successfully run prior to this document because it is responsible for downloading and organizing the following data files: `ng2_pop.rds` (population age and sex structure at local government level) and `ng0_pop.rds` (population age and sex structure at the national level). The R Markdown document `R0_estimation.Rmd` must also be successfully run prior to this document to derive the estimates for the force of infection functions, contact structure and initial seropositivity.  
+
+## Packages
+
+The needed packages:
+
+```{r message = FALSE}
+library(magrittr)
+library(tidyverse)
+```
+
+## Data
+
+### Nigeria demographic data
+
+Here, we read in some basic demographic data (age-structure/gender split) at the local government level and national level in Nigeria (see `nigeria_data_organization_exploration.Rmd` for details on how the data was collected).
+
+```{r}
+ng2_pop <- readRDS(ng2_pop_path)
+ng0_pop <- readRDS(ng0_pop_path)
+```
+
+### MCMC fitting data
+
+Next, we read in the MCMC fitting data from the study of the seroprevalence data (see `R0_estimation.Rmd` for details).
+
+```{r}
+ng1_mean_seropositivity_estimates <- readRDS(file.path(MCMC_ESTIMATES_FOLDER,
+                                                       "MCMC_piecewise_lambda_fit_mean_seropositivity_estimates.rds"))
+ng1_lambda_estimates <- readRDS(file.path(MCMC_ESTIMATES_FOLDER, 
+                                          "MCMC_piecewise_lambda_fit_lambda_estimates.rds"))
+contact_structure <- readRDS(file.path(MCMC_ESTIMATES_FOLDER,
+                                       "MCMC_piecewise_lambda_fit_contact_structure.rds"))
+ng0_mean_seropositivity_estimates <- readRDS(file.path(MCMC_ESTIMATES_FOLDER,
+                                                       "ng0_MCMC_piecewise_lambda_fit_mean_seropositivity_estimates.rds"))
+ng0_lambda_estimates <- readRDS(file.path(MCMC_ESTIMATES_FOLDER, 
+                                          "ng0_MCMC_piecewise_lambda_fit_lambda_estimates.rds"))
+```
+
+## Initial conditions
+
+In this section, we distribute the individuals in each age group across the ten epidemiological classes (i.e. $M, S, E, I, R, V, SP_1, SP_2, SP_3, EP$) for each state in Nigeria.
+
+```{r}
+# `initialize_pop` takes as arguments the state name string `this_state` and returns a named numeric vector of the initial conditions for that state. 
+initialize_pop <- function(this_state, mean_seropositivity_estimates, 
+                           lambda_estimates, contact_structure) {
+  # retrieve initial age distribution in months
+  if (this_state=="Nigeria") 
+    initial_age_distribution <- readRDS(file=file.path(INITIAL_CONDITIONS_FOLDER, "initial_age_distribution_country.rds"))
+  else 
+    initial_age_distribution <- readRDS(file=file.path(INITIAL_CONDITIONS_FOLDER, "initial_age_distribution_list.rds"))[[this_state]]
+  
+  # retrieves the basic parameters
+  parameters <- readRDS(file=file.path(PARAMETERS_FOLDER, this_state, "basic_parameters.rds"))
+  
+  # retrieve seropositivity estimates for the state
+  state_sero_pos_data <- mean_seropositivity_estimates[[this_state]]
+  
+  # retrieve force of infection data for the state (we use the mean force of infection)
+  state_foi_data <- lambda_estimates[[this_state]] %>% colMeans()
+  base_agegrps <- contact_structure$agegrps
+  
+  # distribute population across epidemiological classes
+  classes <- c("M", "S", "E", "I", "R", "V", "1SP", "2SP", "3SP", "EP")
+  init_conds_list <- list()
+  for (ii in 1:nrow(initial_age_distribution)) {
+    agegrp <- initial_age_distribution[ii, "agegrp"]
+    agegrp_n <- initial_age_distribution[ii, "n"]
+    agegrp_index <- ii
+    
+    # get seropositivity for age group
+    seropos <- state_sero_pos_data[findInterval(agegrp/12, state_sero_pos_data$age-1), "seropos"]
+    
+    # get foi for age group
+    foi <- state_foi_data[findInterval(agegrp/12, base_agegrps)]/365
+    
+    # set initial conditions
+    THREE_MONTHS_TO_DAYS <- 90
+    if (agegrp==0) {
+      initR <- 0; initM <- (seropos*agegrp_n)
+    } else {
+      initR <- (seropos*agegrp_n); initM <- 0
+    }
+    initI <- (1-seropos)*agegrp_n*foi*(1/parameters$gamma[paste("gamma", ii, sep="")])
+    initE <- (1-seropos)*agegrp_n*foi*(1/parameters$sigma[paste("sigma", ii, sep="")])
+    initS <- agegrp_n - initR - initI - initE - initM
+    initSP1 <- parameters$f[paste("f", ii, sep="")]*initS*(THREE_MONTHS_TO_DAYS)
+    initSP2 <- parameters$f[paste("f", ii, sep="")]*initS*(THREE_MONTHS_TO_DAYS)
+    initSP3 <- parameters$f[paste("f", ii, sep="")]*initS*(THREE_MONTHS_TO_DAYS)
+    initS <- initS - initSP1 - initSP2 - initSP3
+    initEP <- initSP1*foi*(1/parameters$sigma[paste("sigma", ii, sep="")])
+    initE <- initE - initEP
+    initV <- 0
+    init_conds <- c(initM, initS, initE, initI, initR, initV, initSP1, initSP2, initSP3, initEP)
+    names(init_conds) <- paste(classes, ii, sep="")
+    init_conds_list[[ii]] <- init_conds
+  }
+  init_conds <- do.call(c, init_conds_list)
+  init_conds <- init_conds[sapply(1:length(classes), 
+                                  function(x) seq(x, nrow(initial_age_distribution)*length(classes), length(classes)))]
+  return(init_conds)
+}
+```
+ 
+### State-level
+
+```{r}
+states <- sort(unique(pull(ng2_pop, state)))
+init_conds_list <- purrr::map(states, 
+                              function(x) initialize_pop(this_state=x, 
+                                                         mean_seropositivity_estimates=ng1_mean_seropositivity_estimates, 
+                                                         lambda_estimates=ng1_lambda_estimates, 
+                                                         contact_structure=contact_structure))
+names(init_conds_list) <- states
+saveRDS(init_conds_list, file=file.path(INITIAL_CONDITIONS_FOLDER, "initial_conditions_list.rds"))
+```
+
+### National-level
+
+```{r}
+init_conds <- initialize_pop(this_state="Nigeria", 
+                             mean_seropositivity_estimates=list("Nigeria"=ng0_mean_seropositivity_estimates), 
+                             lambda_estimates=list("Nigeria"=ng0_lambda_estimates), 
+                             contact_structure=contact_structure)
+saveRDS(init_conds, file=file.path(INITIAL_CONDITIONS_FOLDER, "initial_conditions_country.rds"))
+```
