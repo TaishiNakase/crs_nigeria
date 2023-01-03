@@ -1,0 +1,1285 @@
+---
+title: "Dynamic analysis"
+output:
+  html_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+knitr::knit_hooks$set(
+  margin1 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin2 = function(before, options, envir) {
+    if (before) par(mgp = c(2, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin3 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", mai = rep(.1, 4))
+    else NULL
+  }
+)
+
+knitr::opts_chunk$set(echo       = TRUE,
+                      margin1    = TRUE,
+                      fig.retina = 2,
+                      fig.align  = "center")
+
+l <- "en_US.UTF-8"
+Sys.setenv(LANGAGE = l)
+Sys.setlocale(locale = l)
+Sys.setlocale("LC_MESSAGES", l)
+```
+
+## Preamble
+
+In this document, we perform the dynamic risk assessment. In particular, we investigate how the transient CRS dynamics and 30-year CRS burden change when we allow modest improvements in routine RCV coverage over time and introduce supplemental immunization activities (SIAs). 
+
+Relevant simulations must be performed in `model_simulators.Rmd` prior to running this R Markdown document. 
+
+## Installation of packages
+
+Here are the packages required: 
+
+```{r include=FALSE}
+required <- c("tidyverse", "sf", "magrittr", "cowplot", "RColorBrewer", "lemon")
+to_install <- setdiff(required, row.names(installed.packages()))
+if (length(to_install)) install.packages(to_install)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(sf)
+library(magrittr)
+library(cowplot)
+library(RColorBrewer)
+library(lemon)
+```
+
+## Links to local data sets
+
+Here we use the following links to local data:
+
+```{r}
+DATA_FOLDER <- file.path("..", "data")
+PARAMETERS_FOLDER <- file.path("parameters")
+POPULATION_DATA_FOLDER <- file.path(DATA_FOLDER, "population_data")
+SPATIAL_POLYGONS_FOLDER <- file.path(DATA_FOLDER, "spatial_polygons")
+VACCINATION_DATA_FOLDER <- file.path(DATA_FOLDER, "vaccination_data")
+
+# derived data from `nigeria_data_organization_exploration.Rmd`
+ng1_path <- file.path(SPATIAL_POLYGONS_FOLDER, "ng1.rds")
+ng2_pop_path <- file.path(POPULATION_DATA_FOLDER, "ng2_pop.rds")
+
+# local data
+ng1_fertility_data_path <- file.path(POPULATION_DATA_FOLDER, "ng1_fertility_data.csv")
+ng1_zone_mapping_path <- file.path(POPULATION_DATA_FOLDER, "ng1_zone_designations.xlsx")
+ng1_mcv1_data_path <- file.path(VACCINATION_DATA_FOLDER, "ng1_mcv1_data.xlsx")
+```
+
+These are the paths we use for the simulation output. 
+
+```{r}
+ALL_OUTPUT_FOLDER <- "~/Desktop/output/"
+STATIC_SIMS_FOLDER <- file.path(ALL_OUTPUT_FOLDER, "static_risk_simulations", "raw_simulations")
+DYNAMIC_SIMS_FOLDER <- file.path(ALL_OUTPUT_FOLDER, "dynamic_risk_simulations", "raw_simulations")
+SUMMARY_DYNAMIC_SIMS_FOLDER <- file.path(ALL_OUTPUT_FOLDER, "dynamic_risk_simulations", "summary_simulations")
+SUMMARY_STATIC_SIMS_FOLDER <- file.path(ALL_OUTPUT_FOLDER, "static_risk_simulations", "summary_simulations")
+FIGURES_FOLDER <- file.path("figures", "dynamic_analysis")
+```
+
+Change these paths if you would like to run this on your local device.
+
+## Data sets
+
+Let's read in the main data sets:
+
+```{r}
+ng2_pop <- readRDS(ng2_pop_path)
+ng1_pop <- ng2_pop %>% 
+  group_by(state, gender, agegrp) %>% 
+  summarise(n=sum(n, na.rm=TRUE), .groups="keep") %>% 
+  spread(key="gender", value="n") %>% 
+  mutate(n=m+f) %>% 
+  ungroup()
+ng1_zone_mapping <- readxl::read_excel(ng1_zone_mapping_path)
+ng1 <- readRDS(ng1_path) %>%
+  left_join(ng1_zone_mapping, by="state")
+ng1_mcv1_data <- readxl::read_excel(ng1_mcv1_data_path)
+ng1_cbr_data <- read.csv(ng1_fertility_data_path) %>% 
+  gather(key="agegrp", value="asfr", 2:ncol(.)) %>% 
+  mutate(agegrp=substr(gsub("X", "", agegrp), 1, 2)) %>%
+  right_join(ng1_pop, by=c("state", "agegrp")) %>% 
+  mutate(asfr=ifelse(is.na(asfr), 0, asfr), 
+         births=asfr*f) %>% 
+  group_by(state) %>% 
+  summarise(cbr=sum(births)/sum(n)*1000, .groups="keep") %>% 
+  as.data.frame()
+```
+
+## Preliminary simulation output data management
+
+We start by organizing the simulation output. 
+
+### CRS burden: simple dynamic analysis (improvements in routine coverage)
+
+We start by computing the CRS incidence and birth time series for each state. 
+
+```{r eval=FALSE}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+scenarios <- c(0, 0.01, 0.025, 0.05, 0.1)
+all_basic_scenarios_crs_incidence_list <- list()
+for (this_state in states) {
+  print(this_state)
+  crs_incidence_list <- list()
+  for (ii in seq_along(scenarios)) {
+    # retrieve the simulation output for the desired state
+    if (scenarios[ii]==0) {
+      output_files <- list.files(path=STATIC_SIMS_FOLDER, pattern=paste(this_state, "tf30", "vac", sep="_"))
+      num_files <- length(output_files)
+      for (jj in 1:min(num_files, 100)) {
+        output_files[[jj]] <- paste(this_state, "tf30", "vac", paste0("simNum", jj), sep="_")
+      }
+    } else {
+      output_files <- list.files(path=DYNAMIC_SIMS_FOLDER,
+                                 pattern=paste(this_state, "tf30", paste0("vacRate", scenarios[ii]*1000, "_"), sep="_"))
+      num_files <- length(output_files)
+      for (jj in 1:num_files) {
+        output_files[[jj]] <- paste(this_state, "tf30", paste0("vacRate", scenarios[ii]*1000), paste0("simNum", jj), sep="_")
+      }
+    }
+    
+    # retrieve the crs incidence and births in each simulation
+    params <- readRDS(file=file.path(PARAMETERS_FOLDER, this_state, "basic_parameters.rds"))
+    state_crs_incidence_list <- list()
+    pb = txtProgressBar(min = 0, max = length(output_files), initial = 0, style=3)
+    for (jj in seq_along(output_files)) {
+      if (scenarios[ii]==0) sim <- readRDS(file.path(STATIC_SIMS_FOLDER, output_files[[jj]]))
+      else sim <- readRDS(file.path(DYNAMIC_SIMS_FOLDER, output_files[[jj]]))
+      
+      # compute crs incidence
+      EP <- sim[, paste("EP", 1:params$num_stages, sep="")] %>% as.data.frame()
+      sigma <- params$sigma
+      c <- 0.65
+      crs_incidence <- apply(EP, 1, function(x) sum(c*x*sigma))
+      state_crs_incidence_list[[jj]] <- crs_incidence
+      setTxtProgressBar(pb, jj)
+    }
+    close(pb)
+    crs_incidence_list[[ii]] <- do.call(cbind, state_crs_incidence_list) %>% 
+      as.data.frame() %>% 
+      mutate(time=sim[, 1]) %>% 
+      select(time, dplyr::everything()) %>% 
+      setNames(c("time", paste("sim", seq_along(output_files), sep="")))
+  }
+  all_basic_scenarios_crs_incidence_list[[this_state]] <- crs_incidence_list
+}
+saveRDS(all_basic_scenarios_crs_incidence_list, file=file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, "all_basic_scenarios_crs_incidence_list.rds"))
+```
+
+Let's compute the 30-year CRS burden for each simulation in each state under each scenario.
+
+```{r eval=FALSE}
+compute_crs_burden_distribution <- function(this_state, crs_incidence_list, births_list, scenarios) {
+  state_crs_incidence_list <- crs_incidence_list[[this_state]]
+  state_births <- births_list[[this_state]]
+  
+  # compute the long-term CRS burden in each simulation
+  output_list <- list()
+  for (jj in seq_along(scenarios)) {
+    state_crs_incidence <- state_crs_incidence_list[[jj]]
+    crs_burdens <- rep(NA, ncol(state_crs_incidence)-1)
+    for (ii in 1:(ncol(state_crs_incidence)-1)) {
+      crs_incidence <- state_crs_incidence[, 1+ii]
+      births <- state_births[, 2]
+      crs_burdens[ii] <- sum(crs_incidence)/sum(births)*10^5
+    }
+    output_list[[jj]] <- data.frame(scenario=scenarios[jj], state=this_state, crs_burden=crs_burdens, sim=seq_along(crs_burdens))
+  }
+  output <- do.call(rbind, output_list)
+  return(output)
+}
+births_list <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "births_series_list.rds"))
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+scenarios <- c(0, 0.01, 0.025, 0.05, 0.1) 
+crs_burden_dist <- do.call(rbind, purrr::map(states, function(x) 
+  compute_crs_burden_distribution(x, crs_incidence_list=all_basic_scenarios_crs_incidence_list, births_list=births_list, scenarios=scenarios)))
+saveRDS(crs_burden_dist, file=file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, "simple_dynamic_crs_burden_dist.rds"))
+```
+
+Let's also read in the simulations performed for each state at the median $R_0$. 
+
+```{r eval=FALSE}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+scenarios <- c(-1, 0, 0.01, 0.025, 0.05, 0.1)
+median_r0_simNums <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "median_r0_simNums_optimization.rds"))
+ng0_median_r0_simNum <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "ng0_r0_simNums_optimization.rds"))
+median_r0_simNums <- c(median_r0_simNums, "Nigeria"=as.numeric(ng0_median_r0_simNum["median"]))
+basic_scenarios_medR0_crs_incidence_list <- list()
+for (this_state in states) {
+  print(this_state)
+  median_r0_simNum <- median_r0_simNums[this_state]
+  crs_incidence_list <- list()
+  for (ii in seq_along(scenarios)) {
+    # retrieve the simulation output for the desired state
+    if (scenarios[ii]==-1) {
+      output_file <- file.path(STATIC_SIMS_FOLDER, paste0(this_state, "_tf30", "_noVac", "_simNum", median_r0_simNum))
+    } else {
+      output_file <- file.path(DYNAMIC_SIMS_FOLDER, paste0(this_state, "_tf30", "_vacRate", scenarios[ii]*1000, "_simNum", median_r0_simNum))
+    }
+    
+    # retrieve the crs incidence and births in each simulation
+    params <- readRDS(file=file.path(PARAMETERS_FOLDER, this_state, "basic_parameters.rds"))
+    sim <- readRDS(output_file)
+    
+    # compute crs incidence
+    EP <- sim[, paste("EP", 1:params$num_stages, sep="")] %>% as.data.frame()
+    sigma <- params$sigma
+    c <- 0.65
+    crs_incidence <- apply(EP, 1, function(x) sum(c*x*sigma))
+    crs_incidence_list[[ii]] <- crs_incidence %>% 
+      as.data.frame() %>% 
+      mutate(time=sim[, 1]) %>% 
+      select(time, dplyr::everything()) %>% 
+      setNames(c("time", paste0("s", ii)))
+  }
+  scenario_names <- c("baseline", 0, 0.01, 0.025, 0.05, 0.1)
+  names(scenario_names) <- paste("s", 1:6, sep="")
+  basic_scenarios_medR0_crs_incidence_list[[this_state]] <- purrr::reduce(crs_incidence_list, left_join, by="time") %>% 
+    gather(key="scenario", value="crs", 2:ncol(.)) %>% 
+    mutate(scenario=scenario_names[scenario], 
+           state=this_state, simNum=median_r0_simNum) %>% 
+    select(state, simNum, time, scenario, crs)
+}
+saveRDS(basic_scenarios_medR0_crs_incidence_list, file=file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, "basic_scenarios_medR0_crs_incidence_list.rds"))
+```
+
+### CRS burden: advanced dynamic analysis (SIAs)
+
+We start by computing the CRS incidence and birth time series for each state. 
+
+```{r eval=FALSE}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+scenarios <- c(0, 0.01, 0.025, 0.05, 0.1)
+sia_types <- c("sia1", "sia2")
+for (this_sia in sia_types) {
+  all_advanced_scenarios_crs_incidence_list <- list()
+  for (this_state in states) {
+    print(this_state)
+    crs_incidence_list <- list()
+    for (ii in seq_along(scenarios)) {
+      # retrieve the simulation output for the desired state
+      output_files <- list.files(path=DYNAMIC_SIMS_FOLDER,
+                                 pattern=paste(this_state, "tf30", this_sia, paste0("vacRate", scenarios[ii]*1000, "_"), sep="_"))
+      num_files <- length(output_files)
+      for (jj in 1:min(100, num_files)) {
+        output_files[[jj]] <- paste(this_state, "tf30", this_sia, paste0("vacRate", scenarios[ii]*1000), paste0("simNum", jj), sep="_")
+      }
+      
+      # retrieve the crs incidence and births in each simulation
+      params <- readRDS(file=file.path(PARAMETERS_FOLDER, this_state, "basic_parameters.rds"))
+      state_crs_incidence_list <- list()
+      pb = txtProgressBar(min = 0, max = length(output_files), initial = 0, style=3)
+      for (jj in seq_along(output_files)) {
+        sim <- readRDS(file.path(DYNAMIC_SIMS_FOLDER, output_files[[jj]]))
+        
+        # compute crs incidence
+        EP <- sim[, paste("EP", 1:params$num_stages, sep="")] %>% as.data.frame()
+        sigma <- params$sigma
+        c <- 0.65
+        crs_incidence <- apply(EP, 1, function(x) sum(c*x*sigma))
+        state_crs_incidence_list[[jj]] <- crs_incidence
+        setTxtProgressBar(pb, jj)
+      }
+      close(pb)
+      crs_incidence_list[[ii]] <- do.call(cbind, state_crs_incidence_list) %>% 
+        as.data.frame() %>% 
+        mutate(time=sim[, 1]) %>% 
+        select(time, dplyr::everything()) %>% 
+        setNames(c("time", paste("sim", seq_along(output_files), sep="")))
+    }
+    all_advanced_scenarios_crs_incidence_list[[this_state]] <- crs_incidence_list
+  }
+  saveRDS(all_advanced_scenarios_crs_incidence_list, file=file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, paste0("all_advanced_scenarios_", this_sia, "_crs_incidence_list.rds")))
+}
+```
+
+Let's compute the 30-year CRS burden for each simulation in each state under each scenario.
+
+```{r eval=FALSE}
+compute_crs_burden_distribution <- function(this_state, crs_incidence_list, births_list, scenarios) {
+  state_crs_incidence_list <- crs_incidence_list[[this_state]]
+  state_births <- births_list[[this_state]]
+  
+  # compute the long-term CRS burden in each simulation
+  output_list <- list()
+  for (jj in seq_along(scenarios)) {
+    state_crs_incidence <- state_crs_incidence_list[[jj]]
+    crs_burdens <- rep(NA, ncol(state_crs_incidence)-1)
+    for (ii in 1:(ncol(state_crs_incidence)-1)) {
+      crs_incidence <- state_crs_incidence[, 1+ii]
+      births <- state_births[, 2]
+      crs_burdens[ii] <- sum(crs_incidence)/sum(births)*10^5
+    }
+    output_list[[jj]] <- data.frame(scenario=scenarios[jj], state=this_state, crs_burden=crs_burdens, sim=seq_along(crs_burdens))
+  }
+  output <- do.call(rbind, output_list)
+  return(output)
+}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+scenarios <- c(0, 0.01, 0.025, 0.05, 0.1) 
+for (this_sia in c("sia1", "sia2")) {
+  all_advanced_scenarios_crs_incidence_list <- readRDS(file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, paste0("all_advanced_scenarios_", this_sia, "_crs_incidence_list.rds")))
+  advanced_dynamic_crs_burden_dist <- do.call(rbind, purrr::map(states, function(x) 
+    compute_crs_burden_distribution(x, 
+                                    crs_incidence_list=all_advanced_scenarios_crs_incidence_list, 
+                                    births_list=births_list, 
+                                    scenarios=scenarios))) %>% 
+    as.data.frame() %>% 
+    mutate(sia=this_sia)
+  saveRDS(advanced_dynamic_crs_burden_dist, file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, paste0("advanced_dynamic_", this_sia, "_crs_burden_dist.rds")))
+}
+```
+
+Let's also read in the simulations performed for each state at the median $R_0$. 
+
+```{r eval=FALSE}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+scenarios <- c(-1, 0, 0.01, 0.025, 0.05, 0.1)
+median_r0_simNums <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "median_r0_simNums_optimization.rds"))
+ng0_median_r0_simNum <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "ng0_r0_simNums_optimization.rds"))
+median_r0_simNums <- c(median_r0_simNums, "Nigeria"=as.numeric(ng0_median_r0_simNum["median"]))
+for (this_sia in c("sia1", "sia2")) {
+  advanced_scenarios_medR0_crs_incidence_list <- list()
+  for (this_state in states) {
+    print(this_state)
+    median_r0_simNum <- median_r0_simNums[this_state]
+    crs_incidence_list <- list()
+    for (ii in seq_along(scenarios)) {
+      # retrieve the simulation output for the desired state
+      if (scenarios[ii]==-1) {
+        output_file <- file.path(STATIC_SIMS_FOLDER, paste0(this_state, "_tf30", "_noVac", "_simNum", median_r0_simNum))
+      } else {
+        output_file <- file.path(DYNAMIC_SIMS_FOLDER, paste0(this_state, "_tf30_", this_sia, "_vacRate", scenarios[ii]*1000, "_simNum", median_r0_simNum))
+      }
+      
+      # retrieve the crs incidence and births in each simulation
+      params <- readRDS(file=file.path(PARAMETERS_FOLDER, this_state, "basic_parameters.rds"))
+      sim <- readRDS(output_file)
+      
+      # compute crs incidence
+      EP <- sim[, paste("EP", 1:params$num_stages, sep="")] %>% as.data.frame()
+      sigma <- params$sigma
+      c <- 0.65
+      crs_incidence <- apply(EP, 1, function(x) sum(c*x*sigma))
+      crs_incidence_list[[ii]] <- crs_incidence %>% 
+        as.data.frame() %>% 
+        mutate(time=sim[, 1]) %>% 
+        select(time, dplyr::everything()) %>% 
+        setNames(c("time", paste0("s", ii)))
+    }
+    scenario_names <- c("baseline", 0, 0.01, 0.025, 0.05, 0.1)
+    names(scenario_names) <- paste("s", 1:6, sep="")
+    advanced_scenarios_medR0_crs_incidence_list[[this_state]] <- purrr::reduce(crs_incidence_list, left_join, by="time") %>% 
+      gather(key="scenario", value="crs", 2:ncol(.)) %>% 
+      mutate(scenario=scenario_names[scenario], 
+             state=this_state, simNum=median_r0_simNum, 
+             sia=this_sia) %>% 
+      select(sia, state, simNum, time, scenario, crs)
+  }
+  saveRDS(advanced_scenarios_medR0_crs_incidence_list, file=file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, 
+                                                                   paste0("advanced_scenarios_", this_sia, "_medR0_crs_incidence_list.rds")))
+}
+```
+
+## Simulation datasets
+
+Here, we read in the organized simulation output data. 
+
+### CRS burden: baseline analysis (without SIAs and improvement over time)
+
+```{r}
+baseline_crs_incidence_list <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "crs_incidence_series_list.rds"))
+baseline_crs_burden_dist <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "crs_burden_dist.rds"))
+births_list <- readRDS(file.path(SUMMARY_STATIC_SIMS_FOLDER, "births_series_list.rds"))
+```
+
+### CRS burden: simple dynamic analysis (improvements in routine coverage)
+
+```{r}
+all_basic_scenarios_crs_incidence_list <- readRDS(file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, "all_basic_scenarios_crs_incidence_list.rds"))
+simple_dynamic_crs_burden_dist <- readRDS(file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, "simple_dynamic_crs_burden_dist.rds"))
+basic_scenarios_medR0_crs_incidence_list <- readRDS(file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, "basic_scenarios_medR0_crs_incidence_list.rds"))
+```
+
+### CRS burden: advanced dynamic analysis (SIAs)
+
+```{r}
+all_advanced_scenarios_sia1_crs_incidence_list <- readRDS(file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, "all_advanced_scenarios_sia1_crs_incidence_list.rds"))
+advanced_dynamic_sia1_crs_burden_dist <- readRDS(file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, "advanced_dynamic_sia1_crs_burden_dist.rds"))
+advanced_scenarios_sia1_medR0_crs_incidence_list <- readRDS(file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, "advanced_scenarios_sia1_medR0_crs_incidence_list.rds"))
+all_advanced_scenarios_sia2_crs_incidence_list <- readRDS(file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, "all_advanced_scenarios_sia2_crs_incidence_list.rds"))
+advanced_dynamic_sia2_crs_burden_dist <- readRDS(file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, "advanced_dynamic_sia2_crs_burden_dist.rds"))
+advanced_scenarios_sia2_medR0_crs_incidence_list <- readRDS(file.path(SUMMARY_DYNAMIC_SIMS_FOLDER, "advanced_scenarios_sia2_medR0_crs_incidence_list.rds"))
+```
+
+## CRS burden: simple dynamic analysis (improvements in routine coverage)
+
+In this section, we focus on simple dynamic analysis looking at how modest increases in routine rubella vaccination coverage over time diminishes the risk of RCV introduction even at coverage levels that are expected to increase CRS burden in the long run. 
+
+### Yearly CRS incidence
+
+Here, we look at the mean time series of CRS incidence in each state to get an idea of the possible temporal dynamics.
+
+```{r}
+# It takes the state name and returns a time series of the yearly CRS burden with uncertainty bars. 
+plot_yearly_crs_dynamics <- function(this_state, crs_incidence_list, births_list, scenarios, 
+                                     baseline_crs_incidence_list, baseline_births_list) {
+  scenarios <- c(-1, scenarios)
+  state_crs_incidence_list <- crs_incidence_list[[this_state]]
+  state_births <- births_list[[this_state]]
+  baseline_state_crs_incidence <- baseline_crs_incidence_list[[this_state]]
+  baseline_state_births <- baseline_births_list[[this_state]]
+  state_crs_incidence_list <- c(list(baseline_state_crs_incidence), state_crs_incidence_list)
+  
+  # compute the yearly crs incidence (per 100,000 live births) in each simulation
+  yearly_incidence_summary_list <- list()
+  for (this_scenario in seq_along(scenarios)) {
+    state_crs_incidence <- state_crs_incidence_list[[this_scenario]]
+    
+    yearly_incidence_list <- list()
+    yearly_incidence <- rep(0, floor(nrow(state_crs_incidence)/365))
+    for (ii in 1:(ncol(state_crs_incidence)-1)) {
+      crs_incidence <- state_crs_incidence[, 1+ii]
+      if (this_scenario==1) births <- baseline_state_births[, 2]
+      else births <- state_births[, 2]
+      for (jj in seq(1, length(crs_incidence)-1, 365)) {
+        yearly_incidence[floor(jj/365)+1] <- sum(crs_incidence[jj:(jj+364)])/sum(births[jj:(jj+364)])*10^5
+      }
+      yearly_incidence_list[[ii]] <- yearly_incidence
+    }
+    state_yearly_incidence <- do.call(cbind, yearly_incidence_list)
+    state_yearly_incidence_summary <- apply(state_yearly_incidence, 1, function(x) 
+      c(median(x), mean(x), sd(x), quantile(x, c(0.025, 0.975)))) %>% 
+      t() %>% 
+      as.data.frame() %>% 
+      mutate(scenario=this_scenario, year=seq(1, floor(nrow(state_crs_incidence)/365), 1)) %>% 
+      select(scenario, year, dplyr::everything()) %>% 
+      setNames(c("scenario", "year", "median", "mean", "sd", "l95", "u95"))
+    yearly_incidence_summary_list[[this_scenario]] <- state_yearly_incidence_summary
+  }
+  yearly_incidence_summary <- do.call(rbind, yearly_incidence_summary_list) %>% 
+    mutate(scenario=factor(scenario, (-1):6))
+  
+  p <- ggplot(yearly_incidence_summary) + 
+    geom_line(mapping=aes(x=year, y=mean, color=scenario), size=1) + 
+    geom_point(mapping=aes(x=year, y=mean, color=scenario), size=1) +
+    labs(x="Year", y="CRS cases/\n100,000 live births", title=this_state) + 
+    scale_x_continuous(breaks=seq(0, 40, 5)) +
+    scale_color_manual(values=brewer.pal(length(scenarios), "Dark2"), labels=c("No vaccination", paste0(scenarios[-1]*100, "%"))) + 
+    theme_bw() + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(),
+          axis.line = element_line(colour = "black")) + 
+    theme(axis.text = element_text(size=12), axis.title = element_text(size=14))
+  return(p)
+}
+```
+
+```{r echo=FALSE}
+states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
+scenarios <- c(0, 0.01, 0.025, 0.05, 0.1) 
+plots <- purrr::map(states, function(x) 
+  plot_yearly_crs_dynamics(this_state=x, crs_incidence_list=all_basic_scenarios_crs_incidence_list, births_list=births_list, scenarios=scenarios, 
+                           baseline_crs_incidence_list=baseline_crs_incidence_list, baseline_births_list=births_list))
+pdf(file=file.path(FIGURES_FOLDER, "yearly_crs_incidence_timeseries.pdf"), w=8.5, h=11)
+plots_per_page <- 5
+groupings <- split(seq_along(plots), ceiling(seq_along(plots)/plots_per_page))
+for (ii in seq_along(groupings)) {
+  plots_subset <- plots[groupings[[ii]]]
+  num_plots_subset <- length(plots_subset)
+  if (num_plots_subset<plots_per_page) {
+    for (jj in 1:(plots_per_page-num_plots_subset)) {
+      plots_subset[[jj+num_plots_subset]] <- cowplot::ggdraw()
+    }
+  }
+  print(cowplot::plot_grid(plotlist=plots_subset, ncol=1))
+}
+a <- dev.off()
+```
+
+Here, we plot the yearly CRS dynamics at the median $R_0$ for the states. 
+
+```{r}
+# It takes the state name and returns a time series of the yearly CRS burden with uncertainty bars. 
+plot_yearly_crs_dynamics <- function(these_states, state_highlights, crs_incidence_list, births_list, scenarios, file_name, legend=TRUE, scale_factor) {
+  state_yearly_incidence_list <- list()
+  for (this_state in these_states) {
+    state_crs_incidence <- crs_incidence_list[[this_state]]
+    state_births <- births_list[[this_state]]
+    
+    # compute the yearly crs incidence (per 100,000 live births) in each simulation
+    yearly_incidence_list <- list()
+    for (this_scenario in scenarios) {
+      crs_incidence <- state_crs_incidence %>% 
+        filter(scenario==this_scenario) %>% 
+        arrange(-desc(time)) %>% 
+        pull(crs)
+      yearly_incidence <- rep(0, floor(length(crs_incidence)/365))
+      births <- state_births[, 2]
+      for (jj in seq(1, length(crs_incidence)-1, 365)) {
+        yearly_incidence[floor(jj/365)+1] <- sum(crs_incidence[jj:(jj+364)])/sum(births[jj:(jj+364)])*10^5
+      }
+      yearly_incidence_list[[which(this_scenario==scenarios)]] <- yearly_incidence 
+    }
+    state_yearly_incidence_list[[this_state]] <- do.call(cbind, yearly_incidence_list) %>% 
+      as.data.frame() %>% 
+      setNames(scenarios) %>% 
+      mutate(year=seq(1, floor(length(crs_incidence)/365), 1)) %>% 
+      select(year, dplyr::everything()) %>% 
+      gather(key="scenario", value="crs", 2:ncol(.)) %>% 
+      mutate(state=this_state, 
+             color=ifelse(scenario==state_highlights[which(this_state==these_states)], 
+                          "red", "grey"))
+  }
+  state_yearly_incidence <- do.call(rbind, state_yearly_incidence_list) %>% 
+    as.data.frame() %>% 
+    mutate(scenario=factor(scenario, scenarios), 
+           state=factor(state, levels=these_states)) %>% 
+    mutate(color=ifelse(scenario=="baseline", "black", color))
+  
+  p <- ggplot(state_yearly_incidence) + 
+    geom_line(mapping=aes(x=year, y=crs, color=color, group=scenario)) + 
+    geom_point(mapping=aes(x=year, y=crs, shape=scenario), size=0.5) +
+    labs(x="Year", y="CRS cases/100,000 live births") + 
+    scale_x_continuous(breaks=seq(0, 30, 5), expand=c(0, 0)) +
+    scale_color_manual(breaks=c("red", "black", "grey"), 
+                       values=c("red", "black", "lightgrey"), guide="none") + 
+    scale_shape_manual(values=c(15, 16, 17, 18, 8, 3),
+                       labels=c("No vaccination", 
+                                "Routine only", 
+                                "Routine + 1% increase", 
+                                "Routine + 2.5% increase", 
+                                "Routine + 5% increase", 
+                                "Routine + 10% increase"), 
+                       guide=guide_legend(override.aes = list(size=2.5))) +
+    theme_bw() + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(),
+          axis.line = element_line(colour = "black")) + 
+    theme(legend.position="bottom", legend.title=element_blank(), 
+          legend.text=element_text(size=8), legend.key.size=unit(0.3, "cm")) + 
+    theme(axis.text = element_text(size=8, color="black"), axis.title.y = element_text(size=8, color="black"), 
+          axis.title.x=element_blank(), strip.text=element_text(size=8, color="black"), 
+          strip.background=element_blank()) + 
+    facet_rep_wrap(~state, ncol=2, scales="free_y")
+  
+  if (!legend) p <- p + theme(legend.position="none")
+  pdf(file=file.path(FIGURES_FOLDER, file_name), w=8, h=11*scale_factor)
+  print(p)
+  a <- dev.off()
+  return(p)
+}
+```
+
+```{r}
+# selected states
+selected_yearly_crs_dynamics <- plot_yearly_crs_dynamics(these_states=c("Adamawa", "Kebbi", "Borno", "Jigawa"), 
+                                                         state_highlights=as.character(c(0, 0.01, 0.025, 0.05)), 
+                                                         crs_incidence_list=basic_scenarios_medR0_crs_incidence_list, 
+                                                         births_list=births_list, 
+                                                         scenarios=c("baseline", 0, 0.01, 0.025, 0.05, 0.1), 
+                                                         file_name="yearly_crs_incidence_timeseries_pub.pdf", 
+                                                         scale_factor=0.3)
+selected_yearly_crs_dynamics
+
+# all states
+states <- c(unique(pull(ng2_pop, state)), "Nigeria")
+state_highlights <- simple_dynamic_crs_burden_dist %>% 
+  left_join(rename(baseline_crs_burden_dist, baseline_crs_burden=crs_burden), 
+            by=c("state", "sim")) %>%
+  group_by(scenario, state) %>% 
+  summarise(mean_relative_burden=mean(crs_burden/baseline_crs_burden), .groups="keep") %>% 
+  ungroup() %>% group_by(state) %>% 
+  mutate(state=factor(state, levels=states)) %>% 
+  arrange(-desc(state), -desc(scenario)) %>% 
+  mutate(is_min_scenario=(scenario==scenario[min(which(mean_relative_burden<1))])) %>%
+  filter(is_min_scenario) %>% 
+  pull(scenario)
+
+plots_per_page <- 16
+groupings <- split(seq_along(states), ceiling(seq_along(states)/plots_per_page))
+scale_factors <- unlist(lapply(groupings, length))/plots_per_page*0.9
+scale_factors[length(groupings)] <- scale_factors[length(groupings)] + 0.075
+for (ii in seq_along(groupings)) {
+  all_yearly_crs_dynamics <- plot_yearly_crs_dynamics(these_states=states[groupings[[ii]]], 
+                                                      state_highlights=as.character(state_highlights)[groupings[[ii]]], 
+                                                      crs_incidence_list=basic_scenarios_medR0_crs_incidence_list, 
+                                                      births_list=births_list, 
+                                                      legend=(ii==length(groupings)), 
+                                                      scenarios=c("baseline", 0, 0.01, 0.025, 0.05, 0.1), 
+                                                      file_name=paste0("yearly_crs_incidence_timeseries_group", ii, ".pdf"), 
+                                                      scale_factor=scale_factors[ii])
+}
+
+```
+
+### Change in 30-year CRS burden
+
+First, let's have a look at how 30-year CRS burden changes in each state following the introduction of RCV vaccination under different rates of improvement in routine coverage over time. 
+
+We will start by showing whether there is an expected increase or decrease relative to the non-introduction scenario. 
+
+```{r fig.height=4}
+plot_mean_crs_burden_binary_change_heatmap <- function(dynamic_crs_burden_dist, baseline_crs_burden_dist, 
+                                                       scenarios, file_name) {
+  crs_burden_summary <- dynamic_crs_burden_dist %>% 
+    left_join(rename(baseline_crs_burden_dist, baseline_crs_burden=crs_burden), 
+                     by=c("state", "sim")) %>%
+    mutate(change_crs_burden=crs_burden-baseline_crs_burden) %>% 
+    group_by(scenario, state) %>% 
+    summarise(mean_change_crs_burden=mean(change_crs_burden), .groups="keep") %>% 
+    mutate(binary_change=ifelse(mean_change_crs_burden>0, "increase", "decrease")) %>% 
+    mutate(scenario=factor(scenario, levels=scenarios)) %>% 
+    mutate(state=ifelse(state=="Federal Capital Territory", "FCT", state))
+  state_order <- sort(unique(pull(crs_burden_summary, state)))
+  state_order <- c(state_order[which(state_order!="Nigeria")], "Nigeria")
+  crs_burden_summary %<>% mutate(state=factor(state, levels=state_order))
+
+  axis_text_colors <- c(rep("black", length(state_order)-1), "red")
+  
+  mean_crs_burden_binary_change_heatmap <- ggplot(data=crs_burden_summary) + 
+    geom_tile(mapping=aes(x=state, y=scenario, fill=binary_change, color=binary_change), color="black") + 
+    labs(y="Rate of improvement", fill="") +
+    scale_y_discrete(labels=paste0(round(scenarios*100, 1), "%"), expand=c(0, 0)) +
+    scale_x_discrete(drop=FALSE, expand=c(0, 0)) + 
+    scale_fill_manual(breaks=c("increase", "decrease"), values=brewer.pal(9, "Set1")[c(1, 3)], labels=c("Increase", "Decrease")) +
+        theme(axis.text.x=element_text(angle=90, size=9, hjust=1, vjust=0.5, color=axis_text_colors), axis.text=element_text(size=9, color="black"), 
+          axis.title.x=element_blank(),
+          axis.title.y=element_text(size=9, color="black"), 
+          legend.position="right", legend.text=element_text(size=9, color="black"), legend.title=element_text(size=9, color="black")) +
+    theme(panel.background=element_blank(), panel.grid=element_blank(), panel.border=element_rect(color="black", fill=NA))
+  
+  return(mean_crs_burden_binary_change_heatmap)
+}
+mean_crs_burden_binary_change_heatmap <- plot_mean_crs_burden_binary_change_heatmap(dynamic_crs_burden_dist=simple_dynamic_crs_burden_dist, 
+                                                                                    baseline_crs_burden_dist=baseline_crs_burden_dist, 
+                                                                                    scenarios=scenarios, 
+                                                                                    file_name="mean_crs_burden_binary_change_heatmap.pdf")
+mean_crs_burden_binary_change_heatmap
+```
+
+Let's have a look at how CRS burden is expected to quantitatively change. 
+
+```{r fig.height=4, fig.width=8}
+plot_mean_crs_burden_change_heatmap <- function(ng1_polygons=ng1, dynamic_crs_burden_dist, baseline_crs_burden_dist, scenarios, file_name) {
+  crs_burden_summary <- dynamic_crs_burden_dist %>% 
+    left_join(rename(baseline_crs_burden_dist, baseline_crs_burden=crs_burden), 
+                     by=c("state", "sim")) %>%
+    mutate(change_crs_burden=crs_burden-baseline_crs_burden) %>% 
+    group_by(scenario, state) %>% 
+    summarise(mean_percent_change_crs_burden=mean(change_crs_burden/baseline_crs_burden)*100, 
+              mean_relative_burden=mean(crs_burden/baseline_crs_burden), .groups="keep") %>% 
+    mutate(scenario=factor(scenario, levels=scenarios)) %>% 
+    ungroup() %>% group_by(state) %>% 
+    arrange(-desc(state), -desc(scenario)) %>% 
+    mutate(is_min_scenario=(scenario==scenario[min(which(mean_relative_burden<1))])) %>% 
+    mutate(state=ifelse(state=="Federal Capital Territory", "FCT", state))
+  state_order <- sort(unique(pull(crs_burden_summary, state)))
+  state_order <- c(state_order[which(state_order!="Nigeria")], "Nigeria")
+  crs_burden_summary %<>% mutate(state=factor(state, levels=state_order))
+
+  # heat map
+  axis_text_colors <- c(rep("black", length(state_order)-1), "red")
+  mean_crs_burden_change_heatmap <- ggplot() + 
+    geom_tile(data=crs_burden_summary, 
+              mapping=aes(x=state, y=scenario, fill=mean_relative_burden, color=mean_relative_burden)) + 
+    geom_point(data=filter(crs_burden_summary, is_min_scenario),
+               mapping=aes(x=state, y=scenario), shape=18) + 
+    scale_fill_gradientn(colours=rev(brewer.pal(11, "RdBu")), breaks=seq(0, 2, 0.5), 
+                         limits=c(0, 2.1), name="Relative\nburden") + 
+    scale_color_gradientn(colours=rev(brewer.pal(11, "RdBu")), breaks=seq(0, 2, 0.5), 
+                          limits=c(0, 2.1), guide="none") + 
+    labs(y="Rate of improvement", fill="Relative\nburden") +
+    scale_y_discrete(labels=paste0(round(scenarios*100, 1), "%"), expand=c(0, 0)) +
+    scale_x_discrete(drop=FALSE, expand=c(0, 0)) + 
+    guides(fill=guide_colorbar(title.position="top", title.hjust=0.5, 
+                             ticks.colour="black", frame.colour="black")) + 
+    theme(axis.text.x=element_text(angle=90, size=8, hjust=1, vjust=0.5, color=axis_text_colors), axis.text=element_text(size=8, color="black"), 
+          axis.title.x=element_blank(),
+          axis.title.y=element_text(size=8, color="black"), 
+          legend.position="right", legend.text=element_text(size=8, color="black"), legend.title=element_text(size=8, color="black"), 
+          legend.key.size=unit(0.3, "cm"), legend.key.width=unit(0.5, "cm"), legend.margin=unit(c(0, 0, 0, 0), "cm")) +
+    theme(panel.background=element_blank(), panel.grid=element_blank(), panel.border=element_rect(color="black", fill=NA))
+  
+  # geographical map
+  ng1_polygons %<>% mutate(state=ifelse(state=="Federal Capital Territory", "FCT", state))
+  min_scenario_map_data <- crs_burden_summary %>% 
+    ungroup() %>% 
+    filter(is_min_scenario, state!="Nigeria") %>% 
+    right_join(ng1_polygons, by="state")
+    
+  color_scale <- rev(brewer.pal(5, "RdYlBu"))
+  color_scale <- brewer.pal(5, "Reds")
+  min_scenario_map <- ggplot(data=min_scenario_map_data) + 
+    geom_sf(mapping=aes(geometry=geometry, fill=scenario), color="black", size=0.3) + 
+    scale_fill_manual(breaks=rev(c(0, 0.01, 0.025, 0.05, 0.10)), values=rev(color_scale), 
+                      labels=rev(paste0(round(scenarios*100, 1), "%")), drop=FALSE) + 
+    theme_bw() + 
+    guides(fill=guide_legend(title.position="top", title.hjust=0.5, 
+                             ticks.colour="black", frame.colour="black")) + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(), 
+          axis.line=element_blank(), axis.ticks=element_blank(), axis.text=element_blank(), 
+          axis.title=element_blank()) + 
+    theme(legend.position=c(0.9, 0.2), legend.key.size=unit(0.3, "cm"), legend.key.width=unit(0.5, "cm"), 
+          legend.text=element_text(size=8), legend.title=element_blank(), 
+          legend.box.background=element_blank(), legend.background=element_blank()) + 
+    theme(plot.margin=unit(c(0, 0.5, 0, 0), "cm"))
+  
+  pAB <- cowplot::plot_grid(mean_crs_burden_change_heatmap, min_scenario_map, nrow=1, rel_widths=c(1, 0.4), 
+                            labels=c("(a)", "(b)"), label_size=10, label_fontface="plain", label_fontfamily="serif")
+  return(pAB)
+}
+mean_crs_burden_change_heatmap <- plot_mean_crs_burden_change_heatmap(dynamic_crs_burden_dist=simple_dynamic_crs_burden_dist, 
+                                                                      baseline_crs_burden_dist=baseline_crs_burden_dist, 
+                                                                      scenarios=c(0, 0.01, 0.025, 0.05, 0.1), 
+                                                                      file_name="mean_crs_burden_change_heatmap.pdf")
+mean_crs_burden_change_heatmap
+```
+
+Let's combine a couple of the plots...
+
+```{r}
+mean_crs_burden_change_heatmap <- plot_mean_crs_burden_change_heatmap(dynamic_crs_burden_dist=simple_dynamic_crs_burden_dist, 
+                                                                      baseline_crs_burden_dist=baseline_crs_burden_dist, 
+                                                                      scenarios=c(0, 0.01, 0.025, 0.05, 0.1), 
+                                                                      file_name="mean_crs_burden_change_heatmap.pdf")
+selected_yearly_crs_dynamics <- plot_yearly_crs_dynamics(these_states=c("Adamawa", "Kebbi", "Borno", "Jigawa"), 
+                                                         state_highlights=as.character(c(0, 0.01, 0.025, 0.05)), 
+                                                         crs_incidence_list=basic_scenarios_medR0_crs_incidence_list, 
+                                                         births_list=births_list, 
+                                                         scenarios=c("baseline", 0, 0.01, 0.025, 0.05, 0.1), 
+                                                         file_name="yearly_crs_incidence_timeseries_pub.pdf", 
+                                                         scale_factor=0.3)
+pAB <- cowplot::plot_grid(mean_crs_burden_change_heatmap, 
+                          selected_yearly_crs_dynamics, 
+                          labels=c("", "(c)"), label_size=10, label_fontface="plain", label_fontfamily="serif", 
+                          rel_heights=c(0.7, 1), 
+                          ncol=1)
+scale_factor <- 0.45
+pdf(file=file.path(FIGURES_FOLDER, "effect_improvements_in_coverage.pdf"), w=8, h=11*scale_factor)
+print(pAB)
+a <- dev.off()
+```
+
+### Relative temporal dynamics
+
+Let's start by computing the yearly CRS incidence in each scenario for each state. 
+
+```{r}
+# compute the yearly crs incidence (per 100,000 live births) in each simulation
+scenarios <- c("baseline", 0, 0.01, 0.025, 0.05, 0.1) 
+states <- c(unique(pull(ng2_pop, state)), "Nigeria")
+
+yearly_incidence_summary_list <- list()
+for (this_state in states) {
+  state_crs_incidence_list <- all_basic_scenarios_crs_incidence_list[[this_state]]
+  baseline_state_crs_incidence <- baseline_crs_incidence_list[[this_state]]
+  state_births <- births_list[[this_state]]
+  state_crs_incidence_list <- c(list(baseline_state_crs_incidence), state_crs_incidence_list)
+  
+  state_yearly_incidence_summary_list <- list()
+  for (this_scenario in seq_along(scenarios)) {
+    state_crs_incidence <- state_crs_incidence_list[[this_scenario]]
+    
+    yearly_incidence_list <- list()
+    yearly_incidence <- rep(0, floor(nrow(state_crs_incidence)/365))
+    for (ii in 1:(ncol(state_crs_incidence)-1)) {
+      crs_incidence <- state_crs_incidence[, 1+ii]
+      births <- state_births[, 2]
+      for (jj in seq(1, length(crs_incidence)-1, 365)) {
+        yearly_incidence[floor(jj/365)+1] <- sum(crs_incidence[jj:(jj+364)])/sum(births[jj:(jj+364)])*10^5
+      }
+      yearly_incidence_list[[ii]] <- yearly_incidence
+    }
+    state_yearly_incidence <- do.call(cbind, yearly_incidence_list) %>% 
+      as.data.frame() %>% 
+      setNames(1:ncol(.)) %>% 
+      mutate(year=1:nrow(.)) %>% 
+      dplyr::select(year, dplyr::everything()) %>% 
+      gather(key="sim", value="crs_burden", 2:ncol(.)) %>% 
+      mutate(scenario=scenarios[this_scenario], state=this_state)
+    state_yearly_incidence_summary_list[[this_scenario]] <- state_yearly_incidence
+  }
+  yearly_incidence_summary_list[[this_state]] <- do.call(rbind, state_yearly_incidence_summary_list)
+}
+yearly_incidence_summary <- do.call(rbind, yearly_incidence_summary_list)
+row.names(yearly_incidence_summary) <- NULL
+```
+
+Let's see the distribution in the relative yearly CRS incidence between the various vaccination scenarios and the non-vaccination scenario. 
+
+```{r}
+plot_expected_yearly_incidence_distributions <- function(these_states, scenarios, yearly_incidence_summary, 
+                                                         dynamic_crs_burden_dist, baseline_crs_burden_dist, 
+                                                         file_name) {
+  # long-term crs burden summary
+  crs_burden_summary <- dynamic_crs_burden_dist %>% 
+    left_join(rename(baseline_crs_burden_dist, baseline_crs_burden=crs_burden), 
+                     by=c("state", "sim")) %>%
+    mutate(change_crs_burden=crs_burden-baseline_crs_burden, 
+           relative_crs_burden=crs_burden/baseline_crs_burden, 
+           percent_change_crs_burden=(crs_burden-baseline_crs_burden)/baseline_crs_burden*100) %>% 
+    mutate(scenario=factor(scenario, levels=scenarios))
+  
+  # yearly incidence summmary
+  baseline_yearly_incidence_summary <- yearly_incidence_summary %>% 
+    filter(scenario=="baseline") %>% 
+    select(-scenario) %>% 
+    rename(baseline_crs_burden=crs_burden)
+  yearly_incidence_summary <- yearly_incidence_summary %>% 
+    filter(scenario!="baseline") %>% 
+    left_join(baseline_yearly_incidence_summary, by=c("year", "sim", "state")) %>% 
+    mutate(crs_burden_diff=crs_burden-baseline_crs_burden) %>% 
+    mutate(above=crs_burden_diff>0) %>% 
+    group_by(state, scenario, sim) %>% 
+    summarise(num_yrs_above=sum(above), 
+              rel_above=ifelse(num_yrs_above==0, NA, mean(crs_burden_diff[above])), .groups="keep") %>% 
+    as.data.frame() %>% 
+    mutate(scenario=factor(scenario, levels=scenarios), 
+           sim=as.numeric(sim))
+  
+  # combined simulation summary
+  combined_crs_summary <- yearly_incidence_summary %>% 
+    left_join(crs_burden_summary, by=c("state", "scenario", "sim")) %>% 
+    filter(state %in% these_states) %>% 
+    select(state, scenario, sim, change_crs_burden, num_yrs_above, rel_above) %>% 
+    gather(key="metric", value="value", c("change_crs_burden", "num_yrs_above", "rel_above")) %>% 
+    mutate(metric=factor(metric, levels=c("change_crs_burden", "num_yrs_above", "rel_above"))) %>% 
+    group_by(state, scenario, metric) %>% 
+    summarise(median=median(value, na.rm=TRUE), 
+              l50=quantile(value, 0.25, na.rm=TRUE), 
+              u50=quantile(value, 0.75, na.rm=TRUE), .groups="keep")
+  these_states[which(these_states=="Federal Capital Territory")] <- "FCT"
+  combined_crs_summary %<>%
+    mutate(state=ifelse(state=="Federal Capital Territory", "FCT", state)) %>%
+    mutate(state=factor(state, levels=these_states))
+
+  dummy_variable_for_axes <- data.frame(state=pull(combined_crs_summary, state)[1], 
+                                        scenario=pull(combined_crs_summary, scenario)[1], 
+                                        metric=c("change_crs_burden", "num_yrs_above", "rel_above"), 
+                                        median=c(0, 0, 0), 
+                                        l50=c(-100, 0, 0), 
+                                        u50=c(20, 30, 40))
+
+  metric_label <- c(change_crs_burden="Change in 30-year CRS burden", 
+                    num_yrs_above="Number years above baseline", 
+                    rel_above="Relative yearly CRS incidence")
+  p <- ggplot(data=combined_crs_summary) + 
+    geom_errorbar(dummy_variable_for_axes, mapping=aes(xmin=l50, xmax=u50, y=scenario), width=0, color="lightgrey") + 
+    geom_vline(xintercept=0, linetype="dashed", color="black") + 
+    geom_errorbar(mapping=aes(xmin=l50, xmax=u50, y=scenario), color="darkred", width=0, size=0.7) + 
+    geom_point(mapping=aes(x=median, y=scenario), color="black", shape=21, fill="white", size=1.2) +
+    scale_y_discrete(labels=paste0(round(scenarios*100, 1), "%"), name="Rate of Improvement") + 
+    facet_grid(vars(state), vars(metric), scale="free", labeller=labeller(metric=metric_label)) + 
+    theme_bw() + 
+    theme(axis.title.x=element_blank()) + 
+    theme(panel.spacing.y = unit(0, "lines"), strip.background=element_rect(fill="white")) + 
+    theme(panel.grid=element_blank(), panel.grid.major.y=element_line(color="lightgrey"), 
+          axis.text=element_text(color="black", size=7), 
+          strip.text=element_text(color="black", size=8), 
+          axis.title=element_text(color="black", size=8))
+    
+  
+  scale_factor <- length(these_states)/14*0.9
+  pdf(file=file.path(FIGURES_FOLDER, file_name), w=8, h=11*scale_factor)
+  print(p)
+  a <- dev.off()
+}
+```
+
+```{r}
+all_states <- c(unique(pull(ng2_pop, state)), "Nigeria")
+plots_per_page <- 14
+groupings <- split(seq_along(all_states), ceiling(seq_along(all_states)/plots_per_page))
+for (ii in seq_along(groupings)) {
+  p <- plot_expected_yearly_incidence_distributions(these_states=all_states[groupings[[ii]]], 
+                                                    scenarios=c(0, 0.01, 0.025, 0.05, 0.1),
+                                                    yearly_incidence_summary=yearly_incidence_summary, 
+                                                    dynamic_crs_burden_dist=simple_dynamic_crs_burden_dist, 
+                                                    baseline_crs_burden_dist=baseline_crs_burden_dist,
+                                                    file_name=paste0("yearly_crs_incidence_dynamics_", "group", ii))
+}
+```
+
+
+## CRS burden: advanced dynamic analysis
+
+In this section, we focus on the dynamic analysis of simulations where routine infant vaccination coverage changes over time alongside regular supplemental immunization campaigns. 
+
+### Yearly CRS incidence (time-series)
+
+Here, we plot the yearly CRS dynamics at the median $R_0$ for all states. 
+
+```{r}
+# It takes the state name and returns a time series of the yearly CRS burden with uncertainty bars. 
+plot_yearly_crs_dynamics <- function(these_states, state_highlights, crs_incidence_list, births_list, scenarios, file_name, legend=TRUE, scale_factor) {
+  state_yearly_incidence_list <- list()
+  for (this_state in these_states) {
+    state_crs_incidence <- crs_incidence_list[[this_state]]
+    state_births <- births_list[[this_state]]
+    
+    # compute the yearly crs incidence (per 100,000 live births) in each simulation
+    yearly_incidence_list <- list()
+    for (this_scenario in scenarios) {
+      crs_incidence <- state_crs_incidence %>% 
+        filter(scenario==this_scenario) %>% 
+        arrange(-desc(time)) %>% 
+        pull(crs)
+      yearly_incidence <- rep(0, floor(length(crs_incidence)/365))
+      births <- state_births[, 2]
+      for (jj in seq(1, length(crs_incidence)-1, 365)) {
+        yearly_incidence[floor(jj/365)+1] <- sum(crs_incidence[jj:(jj+364)])/sum(births[jj:(jj+364)])*10^5
+      }
+      yearly_incidence_list[[which(this_scenario==scenarios)]] <- yearly_incidence 
+    }
+    state_yearly_incidence_list[[this_state]] <- do.call(cbind, yearly_incidence_list) %>% 
+      as.data.frame() %>% 
+      setNames(scenarios) %>% 
+      mutate(year=seq(1, floor(length(crs_incidence)/365), 1)) %>% 
+      select(year, dplyr::everything()) %>% 
+      gather(key="scenario", value="crs", 2:ncol(.)) %>% 
+      mutate(state=this_state, 
+             color=ifelse(scenario==state_highlights[which(this_state==these_states)], 
+                          "red", "grey"))
+  }
+  state_yearly_incidence <- do.call(rbind, state_yearly_incidence_list) %>% 
+    as.data.frame() %>% 
+    mutate(scenario=factor(scenario, scenarios), 
+           state=factor(state, levels=these_states)) %>% 
+    mutate(color=ifelse(scenario=="baseline", "black", color))
+  
+  p <- ggplot(state_yearly_incidence) + 
+    geom_line(mapping=aes(x=year, y=crs, color=color, group=scenario)) + 
+    geom_point(mapping=aes(x=year, y=crs, shape=scenario), size=0.5) +
+    labs(x="Year", y="CRS cases/100,000 live births") + 
+    scale_x_continuous(breaks=seq(0, 30, 5), expand=c(0, 0)) +
+    scale_color_manual(breaks=c("red", "black", "grey"), 
+                       values=c("red", "black", "lightgrey"), guide="none") + 
+    scale_shape_manual(values=c(15, 16, 17, 18, 8, 3),
+                       labels=c("No vaccination", 
+                                "Routine + SIA", 
+                                "Routine + SIA + 1% increase", 
+                                "Routine + SIA + 2.5% increase", 
+                                "Routine + SIA + 5% increase", 
+                                "Routine + SIA + 10% increase"), 
+                       guide=guide_legend(override.aes = list(size=2.5))) +
+    theme_bw() + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(),
+          axis.line = element_line(colour = "black")) + 
+    theme(legend.position="bottom", legend.title=element_blank(), 
+          legend.text=element_text(size=8), legend.key.size=unit(0.5, "cm")) + 
+    theme(axis.text = element_text(size=9), axis.title.y = element_text(size=9), 
+          axis.title.x=element_blank(), strip.text=element_text(size=9), 
+          strip.background=element_blank()) + 
+    facet_rep_wrap(~state, ncol=2, scales="free_y")
+  
+  if (!legend) p <- p + theme(legend.position="none")
+  pdf(file=file.path(FIGURES_FOLDER, file_name), w=8, h=11*scale_factor)
+  print(p)
+  a <- dev.off()
+  return(p)
+}
+```
+
+```{r}
+# all states
+states <- c(unique(pull(ng2_pop, state)), "Nigeria")
+state_highlights <- simple_dynamic_crs_burden_dist %>% 
+  left_join(rename(baseline_crs_burden_dist, baseline_crs_burden=crs_burden), 
+            by=c("state", "sim")) %>%
+  group_by(scenario, state) %>% 
+  summarise(mean_relative_burden=mean(crs_burden/baseline_crs_burden), .groups="keep") %>% 
+  ungroup() %>% group_by(state) %>% 
+  mutate(state=factor(state, levels=states)) %>% 
+  arrange(-desc(state), -desc(scenario)) %>% 
+  mutate(is_min_scenario=(scenario==scenario[min(which(mean_relative_burden<1))])) %>%
+  filter(is_min_scenario) %>% 
+  pull(scenario)
+
+plots_per_page <- 16
+groupings <- split(seq_along(states), ceiling(seq_along(states)/plots_per_page))
+scale_factors <- unlist(lapply(groupings, length))/plots_per_page*0.9
+scale_factors[length(groupings)] <- scale_factors[length(groupings)] + 0.075
+for (ii in seq_along(groupings)) {
+  all_yearly_crs_dynamics <- plot_yearly_crs_dynamics(these_states=states[groupings[[ii]]], 
+                                                      state_highlights=as.character(state_highlights)[groupings[[ii]]], 
+                                                      crs_incidence_list=advanced_scenarios_sia2_medR0_crs_incidence_list, 
+                                                      births_list=births_list, 
+                                                      legend=(ii==length(groupings)), 
+                                                      scenarios=c("baseline", 0, 0.01, 0.025, 0.05, 0.1), 
+                                                      file_name=paste0("advanced_sia2_yearly_crs_incidence_timeseries_group", ii, ".pdf"), 
+                                                      scale_factor=scale_factors[ii])
+}
+```
+
+Here, we plot the yearly CRS dynamics at the median $R_0$ across a range of different scenarios. 
+
+```{r}
+# It takes the state name and returns a time series of the yearly CRS burden with uncertainty bars. 
+combined_yearly_crs_dynamics <- function(these_states, crs_incidence_list, births_list, crs_burden_dist, scenarios, file_name, scale_factor, legend=TRUE) {
+  # yearly crs incidence (per 100,000 live births) for each scenario
+  state_yearly_incidence_list <- list()
+  for (this_state in these_states) {
+    state_crs_incidence <- crs_incidence_list[[this_state]]
+    state_births <- births_list[[this_state]]
+    yearly_incidence_list <- list()
+    for (ii in 1:nrow(scenarios)) {
+      this_sia <- scenarios[ii, "sia"]
+      this_scenario <- scenarios[ii, "scenario"]
+      crs_incidence <- state_crs_incidence %>% 
+        filter(scenario==this_scenario, sia==this_sia) %>% 
+        arrange(-desc(time)) %>% 
+        pull(crs)
+      yearly_incidence <- rep(0, floor(length(crs_incidence)/365))
+      births <- state_births[, 2]
+      for (jj in seq(1, length(crs_incidence)-1, 365)) {
+        yearly_incidence[floor(jj/365)+1] <- sum(crs_incidence[jj:(jj+364)])/sum(births[jj:(jj+364)])*10^5
+      }
+      yearly_incidence_list[[ii]] <- yearly_incidence 
+    }
+    state_yearly_incidence_list[[this_state]] <- do.call(cbind, yearly_incidence_list) %>% 
+      as.data.frame() %>% 
+      setNames(1:nrow(scenarios)) %>% 
+      mutate(year=seq(1, floor(length(crs_incidence)/365), 1)) %>% 
+      select(year, dplyr::everything()) %>% 
+      gather(key="scenario", value="crs", 2:ncol(.)) %>% 
+      mutate(sia=scenarios[as.numeric(scenario), "sia"], 
+             scenario=scenarios[as.numeric(scenario), "scenario"]) %>% 
+      mutate(state=this_state)
+  }
+  state_yearly_incidence <- do.call(rbind, state_yearly_incidence_list) %>% 
+    as.data.frame() %>% 
+    transmute(state=state, scenario=paste0(sia, "_", scenario), year=year, crs=crs) %>% 
+    mutate(scenario=factor(scenario, paste0(scenarios[, "sia"], "_", scenarios[, "scenario"])),
+           state=factor(state, levels=these_states))
+  
+  # long-term CRS burden
+  selected_crs_burden_dist <- crs_burden_dist %>% 
+    mutate(scenario=paste0(sia, "_", scenario)) %>%
+    filter(scenario %in% paste0(scenarios[, "sia"], "_", scenarios[, "scenario"])) %>%
+    group_by(state, scenario) %>% 
+    summarise(med=median(crs_burden), 
+              l25=quantile(crs_burden, 0.25), 
+              u75=quantile(crs_burden, 0.75), .groups="keep") %>%
+    as.data.frame() %>%
+    filter(state %in% these_states) %>% 
+    mutate(scenario=factor(scenario, paste0(scenarios[, "sia"], "_", scenarios[, "scenario"])),
+           state=factor(state, levels=these_states))
+    
+  # y limits 
+  state_y_limits <- select(state_yearly_incidence, state, crs) %>% 
+    rbind(., transmute(selected_crs_burden_dist, state=state, crs=u75)) %>% 
+    group_by(state) %>% 
+    summarise(max_crs=max(crs)) %>% 
+    mutate(state=factor(state, these_states)) %>% 
+    arrange(-desc(state)) %>% 
+    mutate(max_crs=plyr::round_any(max_crs, 5, f = ceiling)) %>% 
+    pull(max_crs)
+    
+  # yearly CRS incidence plot
+  colors <- c("grey", brewer.pal(12, "Paired")[c(5, 6, 3, 4, 2)])
+  labels <- c("No vaccination", 
+              "Routine only ", 
+              "Routine only (2.5% increase)", 
+              "Routine + starting campaign", 
+              "Routine (2.5% increase) + starting campaign",
+              "Routine (2.5% increase) + starting campaign + regular SIAs")
+  dummy_p1_y_limits <- data.frame(state=factor(these_states, levels=these_states),  
+                                  x=1, y=state_y_limits)
+  p1_state_labels <- paste0("                                          ", these_states)
+  names(p1_state_labels) <- these_states
+  p1 <- ggplot(state_yearly_incidence) + 
+    geom_line(mapping=aes(x=year, y=crs, group=scenario, color=scenario)) + 
+    geom_point(mapping=aes(x=year, y=crs, shape=scenario), size=0.7) +
+    geom_point(data=dummy_p1_y_limits, mapping=aes(x=x, y=y), color="white") + 
+    labs(x="Year", y="CRS cases/100,000 live births") + 
+    scale_x_continuous(breaks=seq(0, 30, 5), expand=c(0, 0)) +
+    scale_color_manual(breaks=paste0(scenarios[, "sia"], "_", scenarios[, "scenario"]),
+                       values=colors, 
+                       labels=labels, 
+                       guide=guide_legend(override.aes = list(size=1))) +
+    scale_shape_manual(values=c(15, 16, 17, 18, 8, 3),
+                       breaks=paste0(scenarios[, "sia"], "_", scenarios[, "scenario"]),
+                       labels=labels) +
+    theme_bw() + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(),
+          axis.line = element_line(colour = "black"), 
+          panel.spacing.y=unit(-0.5, "cm")) + 
+    theme(legend.position="bottom", legend.title=element_blank(), 
+          legend.text=element_text(size=8), legend.key.size=unit(0.5, "cm")) + 
+    theme(axis.text = element_text(size=9, color="black"), axis.title.y = element_text(size=9, color="black"), 
+          axis.title.x=element_blank(), strip.text=element_text(size=9, vjust=-1), 
+          strip.background=element_blank()) + 
+    facet_rep_wrap(~state, ncol=1, scales="free_y", labeller=labeller(state=p1_state_labels))
+  p1_legend <- get_legend(p1)
+  p1 <- p1 + theme(legend.position="none")
+  
+  # long-term CRS burden plot
+  dummy_state_labels <- rep("", length(these_states))
+  names(dummy_state_labels) <- these_states
+    dummy_p1_y_limits <- data.frame(state=factor(these_states, levels=these_states),  
+                                  x=paste0(scenarios[1, "sia"], "_", scenarios[1, "scenario"]), 
+                                  y=state_y_limits) %>% 
+      mutate(x=factor(x, paste0(scenarios[, "sia"], "_", scenarios[, "scenario"])))
+  p2 <- ggplot(data=selected_crs_burden_dist) + 
+    geom_point(data=dummy_p1_y_limits, mapping=aes(x=x, y=y), color="white") + 
+    geom_bar(mapping=aes(x=scenario, y=med, fill=scenario), stat="identity", color="black") + 
+    geom_errorbar(mapping=aes(x=scenario, ymin=l25, ymax=u75), color="black", width=0.1) + 
+    scale_x_discrete(labels=rep("", length(colors)), drop=FALSE) + 
+    scale_y_continuous(expand=c(0, 0)) + 
+    scale_fill_manual(breaks=paste0(scenarios[, "sia"], "_", scenarios[, "scenario"]),
+                       values=colors, 
+                       labels=rep("", length(colors)), 
+                       guide="none") + 
+    theme_bw() + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(),
+          axis.line = element_line(colour = "black"), 
+          panel.spacing.y=unit(-0.5, "cm")) + 
+    theme(axis.title.y = element_blank(), 
+          axis.title.x=element_blank(), strip.text=element_text(size=9, color="black"), 
+          strip.background=element_blank(), axis.text.y=element_blank()) + 
+    facet_rep_wrap(~state, ncol=1, scales="free_y", labeller=labeller(state=dummy_state_labels))
+  
+  # combined plot
+  p <- cowplot::plot_grid(p1, p2, nrow=1, rel_widths=c(1, 0.3))
+  if (legend) p <- cowplot::plot_grid(p, p1_legend, ncol=1, rel_heights=c(1, 0.1))
+  pdf(file=file.path(FIGURES_FOLDER, file_name), w=8, h=11*scale_factor)
+  print(p)
+  a <- dev.off()
+  return(p)
+}
+```
+
+
+```{r}
+# organise simulation data
+combined_crs_incidence_list <- purrr::map(1:length(advanced_scenarios_sia1_medR0_crs_incidence_list), 
+                                          function(x) rbind(advanced_scenarios_sia1_medR0_crs_incidence_list[[x]], 
+                                                            advanced_scenarios_sia2_medR0_crs_incidence_list[[x]]))
+combined_crs_incidence_list <- purrr::map(1:length(combined_crs_incidence_list), 
+                                          function(x) rbind(combined_crs_incidence_list[[x]], 
+                                                            mutate(basic_scenarios_medR0_crs_incidence_list[[x]], 
+                                                                   sia="sia0")))
+names(combined_crs_incidence_list) <- names(advanced_scenarios_sia1_medR0_crs_incidence_list)
+scenarios <- data.frame(sia=c("sia0", "sia0", "sia0", "sia2", "sia2", "sia1"),
+                        scenario=c("baseline", "0", "0.025", "0", "0.025", "0.025"))
+modified_simple_dynamics_crs_burden_dist <- simple_dynamic_crs_burden_dist %>% 
+  transmute(state=state, crs_burden=crs_burden, sia="sia0", scenario=scenario, sim=sim)
+all_crs_burden_dist <- do.call(rbind, list(modified_simple_dynamics_crs_burden_dist, 
+                                           advanced_dynamic_sia1_crs_burden_dist, 
+                                           advanced_dynamic_sia2_crs_burden_dist, 
+                                           transmute(baseline_crs_burden_dist, 
+                                                     state=state, crs_burden=crs_burden, sia="sia0", scenario="baseline", sim=sim)))
+
+# plot for selected states
+p <- combined_yearly_crs_dynamics(these_states=c("Adamawa", "Kebbi", "Borno", "Jigawa"), 
+                                  crs_incidence_list=combined_crs_incidence_list, 
+                                  births_list=births_list, 
+                                  crs_burden_dist=all_crs_burden_dist,
+                                  scenarios=scenarios, 
+                                  file_name="advanced_combined_yearly_crs_incidence_timeseries_pub.pdf",
+                                  scale_factor=0.45)
+print(p)
+
+# plot for all states
+states <- c(unique(pull(ng2_pop, state)), "Nigeria")
+plots_per_page <- 10
+groupings <- split(seq_along(states), ceiling(seq_along(states)/plots_per_page))
+scale_factors <- unlist(lapply(groupings, length))/plots_per_page*0.9
+scale_factors[length(groupings)] <- scale_factors[length(groupings)] + 0.075
+for (ii in seq_along(groupings)) {
+  p <- combined_yearly_crs_dynamics(these_states=states[groupings[[ii]]],
+                                    crs_incidence_list=combined_crs_incidence_list, 
+                                    births_list=births_list, 
+                                    crs_burden_dist=all_crs_burden_dist,
+                                    scenarios=scenarios, 
+                                    file_name=paste0("advanced_combined_yearly_crs_incidence_timeseries_group", ii, ".pdf"),
+                                    scale_factor=scale_factors[ii], 
+                                    legend=(ii==length(groupings)))
+}
+
+```
+
+### Change in 30-year CRS burden
+
+Let's compare the 30-year CRS burden under each scenario in each state to the no RCV introduction conditions.
+
+```{r}
+plot_complete_mean_crs_burden_change_heatmap <- function(crs_burden_dist, sia_types, scenarios, file_name) {
+  baseline_crs_burden_dist <- crs_burden_dist %>% 
+    filter(sia=="sia0", scenario=="baseline") %>% 
+    transmute(state=state, sim=sim, baseline_crs_burden=crs_burden)
+  crs_burden_summary <- crs_burden_dist %>% 
+    filter(!(sia=="sia0" & scenario=="baseline")) %>% 
+    left_join(baseline_crs_burden_dist, by=c("state", "sim")) %>%
+    mutate(change_crs_burden=crs_burden-baseline_crs_burden) %>% 
+    group_by(state, sia, scenario) %>% 
+    summarise(mean_percent_change_crs_burden=mean(change_crs_burden/baseline_crs_burden)*100, 
+              mean_relative_burden=mean(crs_burden/baseline_crs_burden), .groups="keep") %>% 
+    mutate(scenario=factor(scenario, levels=scenarios), 
+           sia=factor(sia, sia_types)) %>% 
+    mutate(state=ifelse(state=="Federal Capital Territory", "FCT", state)) %>% 
+    ungroup() %>% group_by(state, sia) %>%  
+    arrange(-desc(state), -desc(sia), -desc(scenario)) %>% 
+    mutate(is_min_scenario=(scenario==scenario[min(which(mean_relative_burden<1))])) 
+  state_order <- sort(unique(pull(crs_burden_summary, state)))
+  state_order <- c(state_order[which(state_order!="Nigeria")], "Nigeria")
+  crs_burden_summary %<>% mutate(state=factor(state, levels=state_order))
+  
+  axis_text_colors <- c(rep("black", length(state_order)-1), "red")
+  strip_labels <- c("Routine\n+ starting campaign\n+ regular SIAs", 
+                    "Routine\n+ starting campaign", 
+                    "Routine only")
+  names(strip_labels) <- sia_types
+  mean_crs_burden_change_heatmap <- ggplot() + 
+    geom_tile(data=crs_burden_summary, 
+              mapping=aes(x=state, y=scenario, fill=mean_relative_burden, color=mean_relative_burden)) + 
+    geom_point(data=filter(crs_burden_summary, is_min_scenario),
+               mapping=aes(x=state, y=scenario), shape=18) + 
+    scale_fill_gradientn(colours=rev(brewer.pal(11, "RdBu")), breaks=seq(0, 2, 0.5), 
+                         limits=c(0, 2.1), name="Relative\nburden") + 
+    scale_color_gradientn(colours=rev(brewer.pal(11, "RdBu")), breaks=seq(0, 2, 0.5), 
+                          limits=c(0, 2.1), guide="none") + 
+    labs(y="Rate of improvement", fill="Relative\nburden") +
+    scale_y_discrete(labels=paste0(round(scenarios*100, 1), "%"), expand=c(0, 0)) +
+    scale_x_discrete(drop=FALSE, expand=c(0, 0)) + 
+    guides(fill=guide_colorbar(title.position="top", title.hjust=0.5, 
+                               ticks.colour="black", frame.colour="black")) + 
+    theme(axis.text.x=element_text(angle=90, size=9, hjust=1, vjust=0.5, color=axis_text_colors), axis.text=element_text(size=9, color="black"), 
+          axis.title.x=element_blank(),
+          axis.title.y=element_text(size=9, color="black"), 
+          legend.position="right", legend.text=element_text(size=9, color="black"), legend.title=element_text(size=9, color="black")) +
+    theme(strip.background=element_blank(), panel.spacing.y = unit(0, "lines"), strip.placement="outside") + 
+    theme(panel.background=element_blank(), panel.grid=element_blank(), panel.border=element_rect(color="black", fill=NA)) + 
+    facet_grid(rows=vars(sia), labeller=labeller(sia=strip_labels))
+  
+  scale_factor <- 0.5
+  pdf(file=file.path(FIGURES_FOLDER, file_name), w=8, h=11*scale_factor)
+  print(mean_crs_burden_change_heatmap)
+  a <- dev.off()
+  return(mean_crs_burden_change_heatmap)
+}
+complete_mean_crs_burden_change_heatmap <- plot_complete_mean_crs_burden_change_heatmap(crs_burden_dist=all_crs_burden_dist,
+                                                                                        sia_types=c("sia1", "sia2", "sia0"),
+                                                                                        scenarios=c(0, 0.01, 0.025, 0.05, 0.1),
+                                                                                        file_name="complete_mean_crs_burden_change_heatmap.pdf")
+complete_mean_crs_burden_change_heatmap
+```
