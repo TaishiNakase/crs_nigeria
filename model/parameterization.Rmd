@@ -1,0 +1,318 @@
+---
+title: "Parameterization of dynamic rubella models"
+output:
+  html_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+knitr::knit_hooks$set(
+  margin1 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin2 = function(before, options, envir) {
+    if (before) par(mgp = c(2, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin3 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", mai = rep(.1, 4))
+    else NULL
+  }
+)
+
+knitr::opts_chunk$set(echo       = TRUE,
+                      margin1    = TRUE,
+                      fig.retina = 2,
+                      fig.align  = "center")
+```
+
+## Links to local data sets
+
+Here we use the following links to data.
+
+```{r}
+DATA_FOLDER <- file.path("..", "data")
+POPULATION_DATA_FOLDER <- file.path(DATA_FOLDER, "population_data")
+R0_ESTIMATION_FOLDER <- file.path("..", "R0_estimation")
+MCMC_ESTIMATES_FOLDER <- file.path(R0_ESTIMATION_FOLDER, "MCMC_estimates")
+PARAMETERS_FOLDER <- file.path("parameters")
+INITIAL_CONDITIONS_FOLDER <- file.path("initial_conditions")
+
+ng2_pop_path <- file.path(POPULATION_DATA_FOLDER, "ng2_pop.rds")
+ng1_fertility_data_path <- file.path(POPULATION_DATA_FOLDER, "ng1_fertility_data.csv")
+ng0_pop_path <- file.path(POPULATION_DATA_FOLDER, "ng0_pop.rds")
+ng0_fertility_data_path <- file.path(POPULATION_DATA_FOLDER, "ng0_fertility_data.rds")
+ng0_mortality_rates_path <- file.path(POPULATION_DATA_FOLDER, "ng0_mortality_rates.rds")
+```
+
+Change them accordingly if you want to run the script locally on your computer.
+
+## Preambule
+
+This document generates the parameters for the MSEIRV age-structured model used for the rubella simulations in each of the thirty-seven states of Nigeria. The R Markdown document `nigeria_data_organization_exploration.Rmd` must be successfully run prior to this document because it is responsible for downloading and organizing the following data files: `ng2_pop.rds` (population age and sex structure at local government level), `ng0_pop.rds` (population age and sex structure at the national level), `ng1_fertility_data.csv` (age-specific fertility rates at the state level), `ng0_fertility_data.rds` (age-specific fertility rates at the national level) and `ng0_mortality_rates.rds` (piece-wise constant mortality rate function at the national level). The R Markdown document `R0_estimation.Rmd` must also be successfully run prior to this document to derive the estimates for the who-acquired-infection-from-whom (WAIFW) matrix and the rate of loss of maternally-derived passive immunity. `initial_conditions.Rmd` must also be run to derived the initial conditions for each state and Nigeria nationally. 
+
+## Packages
+
+The needed packages:
+
+```{r message = FALSE}
+library(magrittr)
+library(tidyverse)
+```
+
+## Data
+
+### Nigeria demographic data
+
+Here, we read in some basic demographic data (age-structure/gender split) at the local government level in Nigeria (see `nigeria_data_organization_exploration.Rmd` for details on how the data was collected).
+
+```{r}
+ng2_pop <- readRDS(ng2_pop_path)
+ng1_fertility_data <- read.csv(ng1_fertility_data_path) %>% 
+    gather(key="agegrp", value="asfr", 2:ncol(.)) %>% 
+    mutate(agegrp=as.numeric(substr(gsub("X", "", agegrp), 1, 2)))
+ng0_pop <- readRDS(ng0_pop_path) %>% 
+  spread(key="gender", value="n") %>% 
+  mutate(state="Nigeria", agegrp=as.numeric(as.character(agegrp)))
+ng0_fertility_data <- readRDS(ng0_fertility_data_path) %>% 
+  filter(asfr>0) %>% 
+  mutate(agegrp=as.numeric(substr(as.character(agegrp), 1, 2))) %>% 
+  select(country, agegrp, asfr)
+ng0_mortality_rates <- readRDS(ng0_mortality_rates_path)
+```
+
+### MCMC fitting data
+
+Next, we read in the MCMC fitting data from the study of the seroprevalence data (see `R0_estimation.Rmd` for details).
+
+```{r}
+all_base_betas <- readRDS(file.path(MCMC_ESTIMATES_FOLDER,
+                                    "MCMC_piecewise_lambda_fit_beta_estimates.rds"))
+base_contact_structure <- readRDS(file.path(MCMC_ESTIMATES_FOLDER,
+                                            "MCMC_piecewise_lambda_fit_contact_structure.rds"))
+omegas <- readRDS(file=file.path(MCMC_ESTIMATES_FOLDER,
+                                 "MCMC_piecewise_lambda_fit_omegas.rds"))
+
+ng0_all_base_betas <- readRDS(file.path(MCMC_ESTIMATES_FOLDER, 
+                                        "ng0_MCMC_piecewise_lambda_fit_beta_estimates.rds"))
+ng0_omegas <- readRDS(file=file.path(MCMC_ESTIMATES_FOLDER,
+                                     "ng0_MCMC_piecewise_lambda_fit_omegas.rds"))
+```
+
+## Population age distribution 
+
+In this section, for each state in Nigeria, we compute the number of individuals in each of the $73$ age groups (i.e. the initial age distribution of the population). The $73$ age groupings considered in this model are as follows: monthly age strata from $0$ to $4$ years ($48$ groups), yearly age strata from $4$ to $20$ years ($16$ groups), five-yearly age strata from $20$ to $60$ years ($8$ groups) and a $60+$ group ($1$ group). 
+
+```{r}
+# desired age groups in months. 
+desired_agegrps <- c(seq(0, 47), seq(4, 19)*12, seq(20, 55, 5)*12, 60*12)
+```
+
+`compute_initial_age_distribution` takes as arguments the population data for Nigeria (`ng2_pop`), the state name string `this_state` and the desired age groups years, and then returns a named numeric vector of the initial age distribution of the population in years. 
+```{r}
+compute_initial_age_distribution <- function(pop_data, this_state, desired_agegrps) {
+  # retrieve the age-structured population data
+  raw_age_data <- pop_data %>% 
+    filter(state==this_state) %>%
+    mutate(n=m+f) %>% 
+    mutate(agegrp_size=c(diff(pull(., agegrp)), 5)) %>%
+    select(agegrp, n, agegrp_size)
+  
+  # split the data into monthly age groups
+  split_agegrps <- function(x) {
+    data.frame(agegrp=seq(x["agegrp"]*12, x["agegrp"]*12+x["agegrp_size"]*12-1),
+               n=rep(x["n"]/(12*x["agegrp_size"]), x["agegrp_size"]*12))
+  }
+  mnthly_raw_age_data <- do.call(rbind, apply(raw_age_data, 1, split_agegrps))
+  
+  # collect the data into our chosen age groups
+  desired_agegrps_df <- data.frame(s=desired_agegrps, e=c(desired_agegrps[-1], Inf))
+  mnthly_age_data <- apply(desired_agegrps_df, 1, function(x) (mnthly_raw_age_data %>% 
+                                                                 filter(agegrp>=x["s"] & agegrp<x["e"]) %>% 
+                                                                 pull(n) %>% 
+                                                                 sum())) %>%
+    data.frame(agegrp=desired_agegrps_df[["s"]], n=.)
+  return(mnthly_age_data)
+}
+```
+
+## State-level: model parameterization
+
+In this section, we systematically generate the parameters for each state. In particular, we generate demographic and epidemiological parameters along with a list of $\beta$ matrices and $\delta$ values for the uncertainty estimates. 
+
+### Functions 
+
+`set_parameters` takes as an argument the state name string `this_state`, the desired age groups `agegrps`, the fertility data for Nigeria `fertility_data`, the mortality data for Nigeria `mortality_data`, and the population data for Nigeria `pop_data`, and then returns a named list of the parameters. NOTE: The effective transmission rates $\beta$ and the rate of loss of maternally-acquired passive immunity $\omega$ are computed separately so they are not included in the returned list of parameters. They have to be added separately.  
+```{r}
+set_parameters <- function(this_state, pop_data, fertility_data, mortality_data, agegrps, base_agegrps) {
+  # compartment characteristics
+  num_stages <- length(agegrps)
+  num_classes <- 10
+  n <- compute_initial_age_distribution(pop_data=pop_data, this_state=this_state, desired_agegrps=agegrps) %>% pull(n)
+  
+  # latency rate (10-day latent period)
+  sigma <- rep(1/10, length(agegrps))
+  names(sigma) <- paste("sigma", 1:length(agegrps), sep="")
+  
+  # recovery rate (10-day infectious period)
+  gamma <- rep(1/10, length(agegrps))
+  names(gamma) <- paste("gamma", 1:length(agegrps), sep="")
+  
+  # pregnancy parameters
+  delta1 <- rep(1/(3*30), length(agegrps))
+  delta2 <- rep(1/(3*30), length(agegrps))
+  delta3 <- rep(1/(3*30), length(agegrps))
+  names(delta1) <- paste("1delta", 1:length(agegrps), sep="")
+  names(delta2) <- paste("2delta", 1:length(agegrps), sep="")
+  names(delta3) <- paste("3delta", 1:length(agegrps), sep="")
+  
+  # seasonal forcing
+  alpha <- as.vector(matrix(0.2, nrow=length(agegrps), ncol=length(agegrps)))
+  names(alpha) <- paste("alpha", 1:(length(agegrps)*length(agegrps)), sep="")
+  
+  # birth rate
+  state_fertility_data <- fertility_data %>% filter(state==this_state)
+  state_pop_data <- pop_data %>% filter(state==this_state)
+  unadj_fertility_data <- state_fertility_data %>% 
+    full_join(state_pop_data, by=c("state", "agegrp")) %>% 
+    mutate(asfr=ifelse(is.na(asfr), 0, asfr)) %>%
+    mutate(b=(f*asfr)/(m+f)/365, n=m+f) %>% 
+    select(agegrp, b, n) %>% 
+    arrange(desc(-agegrp)) %>% 
+    mutate(agegrp_size=c(diff(pull(., agegrp)), 5))
+  split_agegrps <- function(x) {
+    data.frame(agegrp=seq(x["agegrp"]*12, x["agegrp"]*12+x["agegrp_size"]*12-1),
+               b=rep(x["b"], x["agegrp_size"]*12))
+  }
+  f <- do.call(rbind, apply(unadj_fertility_data, 1, split_agegrps)) %>%
+    filter(agegrp %in% agegrps) %>% 
+    pull(b)
+  names(f) <- paste("f", 1:length(agegrps), sep="") # age-specific fertility rates
+  b <- sum(f*n)/sum(n)
+  b <- c(b, rep(0, length(agegrps)-1))
+  names(b) <- paste("b", 1:length(agegrps), sep="")
+  
+  db <- -0.01/365 # daily change in birth rate
+  
+  mus <- mortality_data
+  mu <- mus[findInterval(desired_agegrps/12, base_agegrps)]/365
+  
+  # ageing rate
+  theta <- c(1/(diff(agegrps)*30), 0)
+  names(theta) <- paste("theta", 1:length(agegrps), sep="")
+  
+  
+  parameters <- list(num_stages=num_stages, num_classes=num_classes, sigma=sigma, gamma=gamma, 
+                     mu=mu, `1delta`=delta1, `2delta`=delta2, `3delta`=delta3,
+                     b=b, alpha=alpha, theta=theta, f=f, db=db)
+}
+```
+
+`construct_beta_matrix` takes as arguments the age groups used in the R0 estimation (`base_agegrps`), the beta estimates (`base_betas`), the contact structure from the R0 estimation (`base_contact_mat`) and the desired age groups for the extended model, and returns the beta matrix. 
+```{r}
+construct_beta_matrix <- function(base_agegrps, base_betas, base_contact_mat, desired_agegrps) {
+  beta_matrix <- matrix(NA, nrow=length(desired_agegrps), ncol=length(desired_agegrps))
+  desired_agegrps_interval <- sapply(desired_agegrps, function(x) findInterval(x, base_agegrps))
+  for (ii in seq_along(desired_agegrps)) {
+    for (jj in seq_along(desired_agegrps))
+      beta_matrix[ii, jj] <- base_betas[base_contact_mat[desired_agegrps_interval[ii], 
+                                                         desired_agegrps_interval[jj]]]
+  }
+  return(beta_matrix)
+}
+```
+
+### Parameter generation
+
+```{r results='hide'}
+generate_parameters <- function(this_state, pop_data, fertility_data, mortality_data, omegas,
+                                agegrps, base_betas, base_agegrps, base_contact_mat=base_contact_mat) {
+  # create output file path
+  state_parameter_file_path <- file.path(PARAMETERS_FOLDER, this_state)
+  if (!file.exists(state_parameter_file_path)) dir.create(state_parameter_file_path)
+  
+  # retrieve and save the basic parameters
+  basic_parameters <- set_parameters(this_state=this_state, pop_data=pop_data,
+                                     fertility_data=fertility_data, mortality_data=mortality_data, 
+                                     agegrps=desired_agegrps, base_agegrps=base_agegrps)
+  saveRDS(basic_parameters, file=file.path(state_parameter_file_path, "basic_parameters.rds"))
+
+  # retrieve and save the beta matrices
+  state_base_betas <- base_betas[[this_state]]
+  state_beta_mat_list <- list()
+  for (ii in 1:nrow(state_base_betas)) {
+    base_betas <- as.numeric(state_base_betas[ii, ])
+    beta_matrix <- construct_beta_matrix(base_agegrps=base_agegrps, base_beta=base_betas,
+                                         base_contact_mat=base_contact_mat,
+                                         desired_agegrps=desired_agegrps/12)
+    state_beta_mat_list[[ii]] <- beta_matrix/365
+  }
+  saveRDS(state_beta_mat_list, file=file.path(state_parameter_file_path, "beta_matrices.rds"))
+
+  # retrieve and save the desired subset of omegas
+  omegas <- omegas/365
+  saveRDS(omegas, file=file.path(state_parameter_file_path, "omegas.rds"))
+  
+  return()
+}
+base_agegrps <- base_contact_structure$agegrps
+base_contact_mat <- base_contact_structure$contact_mat
+ng1_pop <- ng2_pop %>% 
+  group_by(state, gender, agegrp) %>% 
+  summarise(n=sum(n, na.rm=TRUE), .groups="keep") %>% 
+  mutate(agegrp=as.numeric(as.character(agegrp))) %>% 
+  spread(key="gender", value="n") %>% 
+  ungroup()
+states <- sort(unique(pull(ng2_pop, state)))
+sapply(states, function(x) generate_parameters(this_state=x, pop_data=ng1_pop, 
+                                               fertility_data=ng1_fertility_data, 
+                                               mortality_data=ng0_mortality_rates, 
+                                               omegas=omegas, 
+                                               base_betas=all_base_betas, 
+                                               base_contact_mat=base_contact_mat,
+                                               base_agegrps=base_agegrps, 
+                                               agegrps=desired_agegrps))
+```
+
+Next, we generate and save the initial age distribution of each state. 
+
+```{r}
+states <- sort(unique(pull(ng2_pop, state)))
+initial_age_distribution_list <- list()
+for (ii in states) {
+  initial_age_distribution_list[[ii]] <- compute_initial_age_distribution(pop_data=ng1_pop, 
+                                                                          this_state=ii,
+                                                                          desired_agegrps=desired_agegrps)
+}
+saveRDS(initial_age_distribution_list, file.path(INITIAL_CONDITIONS_FOLDER, "initial_age_distribution_list.rds"))
+```
+
+## National-level: model parameterization
+
+In this section, we generate the parameters for the entire country at the national level.  
+
+```{r results='hide'}
+base_agegrps <- base_contact_structure$agegrps
+base_contact_mat <- base_contact_structure$contact_mat
+generate_parameters(this_state="Nigeria", 
+                    pop_data=ng0_pop,  
+                    fertility_data=rename(ng0_fertility_data, state=country), 
+                    mortality_data=ng0_mortality_rates,
+                    base_betas=list("Nigeria"=ng0_all_base_betas), 
+                    omegas=ng0_omegas, 
+                    base_contact_mat=base_contact_mat,
+                    base_agegrps=base_agegrps, 
+                    agegrps=desired_agegrps)
+```
+
+Next, we generate and save the initial age distribution for the country. 
+
+```{r}
+initial_age_distribution <- compute_initial_age_distribution(pop_data=ng0_pop, 
+                                                             this_state="Nigeria", 
+                                                             desired_agegrps=desired_agegrps)
+saveRDS(initial_age_distribution, file.path(INITIAL_CONDITIONS_FOLDER, "initial_age_distribution_country.rds"))
+```
