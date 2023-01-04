@@ -1,0 +1,1146 @@
+---
+title: "R0 estimation in Nigeria"
+output:
+  html_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+knitr::knit_hooks$set(
+  margin1 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin2 = function(before, options, envir) {
+    if (before) par(mgp = c(2, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin3 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", mai = rep(.1, 4))
+    else NULL
+  }
+)
+
+knitr::opts_chunk$set(echo       = TRUE,
+                      margin1    = TRUE,
+                      fig.retina = 2,
+                      fig.align  = "center")
+```
+
+## Links to local data sets
+
+Here we use the following links to data.
+
+```{r}
+# directories 
+DATA_FOLDER <- file.path("..", "data")
+POPULATION_DATA_FOLDER <- file.path(DATA_FOLDER, "population_data")
+SPATIAL_POLYGONS_FOLDER <- file.path(DATA_FOLDER, "spatial_polygons")
+RUBELLA_SEROPREVALENCE_DATA_FOLDER <- file.path(DATA_FOLDER, "seroprevalence_data")
+HELPER_SCRIPTS_FOLDER <- file.path("helper_scripts")
+MCMC_FITTING_OUTPUT_FOLDER <- file.path("MCMC_fitting_output")
+MCMC_ESTIMATES_FOLDER <- file.path("MCMC_estimates")
+FIGURES_FOLDER <- file.path("figures")
+
+# derived data from `nigeria_data_organization_exploration.Rmd`
+ng2_pop_path <- file.path(POPULATION_DATA_FOLDER, "ng2_pop.rds")
+ng2_path <- file.path(SPATIAL_POLYGONS_FOLDER, "ng2.rds")
+ng1_path <- file.path(SPATIAL_POLYGONS_FOLDER, "ng1.rds")
+ng1_fertility_data_path <- file.path(POPULATION_DATA_FOLDER, "ng1_fertility_data.csv")
+ng0_selected_mortality_rates_path <- file.path(POPULATION_DATA_FOLDER, "ng0_mortality_rates.rds")
+
+# local data 
+ng1_rub_sero_path <- file.path(RUBELLA_SEROPREVALENCE_DATA_FOLDER, "ng1_rubella_seroprevalence_data.csv")
+ng1_zone_mapping_path <- file.path(POPULATION_DATA_FOLDER, "ng1_zone_designations.xlsx")
+```
+
+Change them accordingly if you want to run the script locally on your computer.
+
+## Preambule
+
+This document focuses on estimating the $R_0$ for rubella in each state of Nigeria using age-stratified serological survey data. 
+
+The R Markdown document `nigeria_data_organization_exploration.Rmd` must be successfully run prior to this document because it is responsible for downloading and organizing the following data files: `ng2_pop.rds` (population age and sex structure at local government level), `ng2.rds` (spatial polygons at the local government level), `ng1.rds` (spatial polygons at the state level), `ng1_fertility_data.csv` (age-specific fertility rates at the state level), and `ng0_mortality_rates.rds` (piece-wise constant mortality rate function at the national level). The administrative zone designations of the states are provided as an xlsx file (`ng1_zone_designations.xlsx`) which is provided in the Github repository. The serological survey data at the state level (`ng1_rubella_seroprevalence_data.csv`) are provided as supplementary material. 
+
+Details on methodology are provided in the supplementary materials. 
+
+
+## Packages
+
+The needed packages:
+
+```{r message = FALSE}
+library(sf)
+library(magrittr)
+library(tidyverse)
+library(RColorBrewer)
+library(rstan)
+library(scales)
+library(lemon)
+rstan_options(auto_write = TRUE)
+```
+
+## Helper functions
+
+Here we include some helper functions for the estimation procedures. 
+
+```{r}
+# plotting scripts
+source(file.path(HELPER_SCRIPTS_FOLDER, "basic_serology_plot.R"))
+source(file.path(HELPER_SCRIPTS_FOLDER, "foi_distribution_plot.R"))
+source(file.path(HELPER_SCRIPTS_FOLDER, "post_pred_dist_plot.R"))
+
+# computational scripts
+source(file.path(HELPER_SCRIPTS_FOLDER, "compute_cum_hazard.R"))
+source(file.path(HELPER_SCRIPTS_FOLDER, "compute_prob_susceptible.R"))
+source(file.path(HELPER_SCRIPTS_FOLDER, "compute_avg_life_exp.R"))
+source(file.path(HELPER_SCRIPTS_FOLDER, "compute_R0.R"))
+```
+
+## Data 
+### Nigeria Demographic/Geographical Data
+
+Here, we read in some basic demographic data (age-structure/gender split) at the local government level in Nigeria (see `nigeria_data_organization_exploration.Rmd` for details on how the data was collected).
+
+```{r}
+ng2_pop <- readRDS(ng2_pop_path)
+ng1_fertility_data <- read.csv(ng1_fertility_data_path)
+ng0_selected_mortality_rates <- readRDS(ng0_selected_mortality_rates_path)
+```
+
+Next, let's read in the spatial polygons data (see `nigeria_data_organization_exploration.Rmd` for details on how the data was collected).
+
+```{r}
+ng1_zone_mapping <- as.data.frame(readxl::read_excel(ng1_zone_mapping_path))
+ng2 <- readRDS(ng2_path)
+ng1 <- readRDS(ng1_path)
+```
+
+### Rubella Seroprevalence Data
+
+Here, we read in and format the rubella serological survey data.
+
+Let's read in the data:
+
+```{r}
+ng1_rub_sero_data <- read.csv(file=ng1_rub_sero_path) %>%
+  transmute(state=State, age=Age+1, positive=Positive, tested=Tested)
+```
+
+Here's what the data looks like:
+
+```{r}
+head(ng1_rub_sero_data)
+```
+
+Let's confirm whether seroprevalence data is available for each state in Nigeria:
+
+```{r}
+setequal(unique(pull(ng2_pop, state)), unique(pull(ng1_rub_sero_data, state)))
+```
+
+Here is what the serological profile looks like for a few states.
+
+```{r echo=FALSE}
+cowplot::plot_grid(basic_serology_plot("Abia", ng1_rub_sero_data), 
+                   basic_serology_plot("Lagos", ng1_rub_sero_data), 
+                   basic_serology_plot("Yobe", ng1_rub_sero_data), 
+                   basic_serology_plot("Jigawa", ng1_rub_sero_data),
+                   basic_serology_plot("Katsina", ng1_rub_sero_data),
+                   basic_serology_plot("Niger", ng1_rub_sero_data), nrow=2)
+```
+
+Let's plot all the panels in a single pdf. 
+
+```{r}
+states <- unique(pull(ng1_rub_sero_data, state)) %>% sort()
+plots <- purrr::map(states, function(x) basic_serology_plot(x, ng1_rub_sero_data))
+
+pdf(file.path(FIGURES_FOLDER, "basic_serology_plots.pdf"), w=8.5, h=11)
+plots_per_page <- 20
+groupings <- split(seq_along(plots), ceiling(seq_along(plots)/plots_per_page))
+for (ii in seq_along(groupings)) {
+  plots_subset <- plots[groupings[[ii]]]
+  num_plots_subset <- length(plots_subset)
+  if (num_plots_subset<plots_per_page) {
+    for (jj in 1:(plots_per_page-num_plots_subset)) {
+      plots_subset[[jj+num_plots_subset]] <- cowplot::ggdraw()
+    }
+  }
+  print(cowplot::plot_grid(plotlist=plots_subset, ncol=4))
+}
+a <- dev.off()
+
+# clean
+rm(groupings, plots, plots_subset)
+rm(a, ii, jj, num_plots_subset, plots_per_page)
+```
+
+## State-level estimation 
+
+### Force of infection
+
+First, we estimate the force of infection in each state for the three age groups (i.e. 0-3 years, 3-15 years and 15+ years). We also simultaneously estimate the rate of loss of maternally-derived passive immunity in infants.
+
+```{r}
+compute_piecewise_lambda_fit <- function(group_id_data, sero_data, agegrps) {
+  sero_data <- sero_data %>% left_join(group_id_data, by="state") %>% arrange(-desc(state), -desc(age))
+  N <- nrow(sero_data)
+  K <- length(unique(pull(sero_data, state)))
+  gs <- sero_data %>% group_by(state) %>% summarise(count=length(state), .groups="keep") %>% pull(count)
+  pos <- sero_data$positive
+  tested <- sero_data$tested
+  age <- sero_data$age
+  agegrp_id <- findInterval(age-1, agegrps)
+  num_agegrp <- length(agegrps)
+  agegrp <- agegrps
+  group_id <- pull(sero_data, group_id)[c(1, 1+cumsum(gs[-length(gs)]))]
+  num_groups <- length(unique(group_id))
+  input_data <- list(N=N, K=K, gs=gs, pos=pos, num_agegrp=num_agegrp, tested=tested, age=age, 
+                     agegrp_id=agegrp_id, num_agegrp=num_agegrp, agegrp=agegrp, group_id=group_id, num_groups=num_groups)
+  init <- list(list(lambda=rnorm(K*num_agegrp-(K-num_groups), 0.1, 0.01)), 
+               list(lambda=rnorm(K*num_agegrp-(K-num_groups), 0.11, 0.01)),
+               list(lambda=rnorm(K*num_agegrp-(K-num_groups), 0.12, 0.01)))
+  fit <- stan(file=file.path(HELPER_SCRIPTS_FOLDER, "piecewise_lambda_fit.stan"), 
+              data = input_data, chains=3, init=init,
+              warmup=2000, iter=4000, cores = 3, control = list(adapt_delta = 0.99), seed=100)
+  return(fit)
+}
+agegrps <- c(0, 3, 15)
+states <- unique(pull(ng1_rub_sero_data, state))
+input <- data.frame(state=states, group_id=seq_along(states)) %>%
+  mutate(group_id=ifelse(state %in% c("Taraba", "Adamawa"), group_id[which(state=="Taraba")], group_id)) %>% 
+  mutate(group_id=ifelse(state %in% c("Katsina", "Kano"), group_id[which(state=="Katsina")], group_id)) 
+group_ids <- pull(input, group_id) %>% unique() %>% sort()
+input$group_id <- sapply(input$group_id, function(x) which(group_ids==x))
+```
+
+Fitting the model to seroprevalence data...
+
+```{r eval=FALSE}
+MCMC_piecewise_lambda_fit <- compute_piecewise_lambda_fit(group_id_data=input, 
+                                                          sero_data=ng1_rub_sero_data,
+                                                          agegrps=agegrps)
+saveRDS(MCMC_piecewise_lambda_fit,
+        file=file.path(MCMC_FITTING_OUTPUT_FOLDER, "MCMC_piecewise_lambda_fit.rds"))
+```
+
+Loading the results of the fitting...
+
+```{r}
+MCMC_piecewise_lambda_fit <- readRDS(file.path(MCMC_FITTING_OUTPUT_FOLDER,
+                                               "MCMC_piecewise_lambda_fit.rds"))
+```
+
+We first have to reformat the force of infection data. 
+
+```{r eval=FALSE}
+all_lambda_data <- rstan::extract(MCMC_piecewise_lambda_fit)[["lambda"]]
+states <- unique(pull(ng1_rub_sero_data, state))
+get_state_lambda <- function(this_state, num_age_grps, group_id_data) {
+  state_pos <- which(this_state==sort(states))
+  lambda_ids <- c((seq(1, num_age_grps-1, 1)-1)*length(states)+state_pos, 
+                  (num_age_grps-1)*length(states)+group_id_data[which(group_id_data$state==this_state), 2])
+  
+  state_lambda_data <- all_lambda_data[, lambda_ids]
+  return(state_lambda_data)
+} 
+state_lambda_data <- purrr::map(states, function(x) get_state_lambda(this_state=x, 
+                                                                     num_age_grps=3, 
+                                                                     group_id_data=input))
+names(state_lambda_data) <- states
+saveRDS(state_lambda_data, file=file.path(MCMC_ESTIMATES_FOLDER,
+                                          "MCMC_piecewise_lambda_fit_lambda_estimates.rds"))
+```
+
+```{r}
+state_lambda_data <- readRDS(file=file.path(MCMC_ESTIMATES_FOLDER,
+                                            "MCMC_piecewise_lambda_fit_lambda_estimates.rds"))
+```
+
+Next, let's plot the force of infection functions for each of the states:
+
+```{r}
+focal_states <- c("Abia", "Lagos", "Yobe", "Jigawa", "Katsina", "Niger")
+plots <- purrr::map(focal_states, function(x) foi_distribution_plot(x, 
+                                                                    state_lambda_data[[x]], 
+                                                                    age_groups=c(0, 3, 15, 45)))
+cowplot::plot_grid(plots[[1]], plots[[2]], plots[[3]], plots[[4]], plots[[5]], plots[[6]],
+                   nrow=2, ncol=3)
+```
+
+Let's see whether the estimated force of infection estimates can replicate the actual data. 
+
+```{r}
+focal_states <- c("Abia", "Lagos", "Yobe", "Jigawa", "Katsina", "Niger")
+states <- unique(pull(ng1_rub_sero_data, state))
+plots <- post_pred_dist_plot(focal_states, 
+                             MCMC_piecewise_lambda_fit,
+                             ng1_rub_sero_data, 
+                             states=states)
+```
+
+### Average period of materally-derived passive immunity
+
+Let's also retrieve and save the estimated rate of loss of maternally-acquired passive immunity for rubella across Nigeria. 
+
+```{r eval=FALSE}
+omegas <- rstan::extract(MCMC_piecewise_lambda_fit)[["delta"]]
+saveRDS(omegas, file=file.path(MCMC_ESTIMATES_FOLDER,
+                               "MCMC_piecewise_lambda_fit_omegas.rds"))
+```
+
+Let's have quick look at the estimated distribution of the average period of maternally-acquired passive immunity for rubella across Nigeria. 
+
+```{r}
+avg_passive_immunity <- rstan::extract(MCMC_piecewise_lambda_fit)[["delta_inv"]] %>%
+  as.data.frame() %>% 
+  setNames("avg_period")
+mean_avg_passive_immunity <- mean(avg_passive_immunity$avg_period)*12
+l90_avg_passive_immunity <- quantile(avg_passive_immunity$avg_period, 0.05)*12 
+u90_avg_passive_immunity <- quantile(avg_passive_immunity$avg_period, 0.95)*12 
+period_maternal_immunity <- ggplot() + 
+  geom_histogram(data=avg_passive_immunity, aes(x=avg_period*12, y=..density..), 
+                 fill="#8DA0CB", color="black", bins=30) +
+  scale_x_continuous(breaks=seq(7.5, 10.5), limits=c(7.5, 10.5), expand=c(0, 0)) + 
+  scale_y_continuous(breaks=seq(0, 1.5, 0.5), limits=c(0, 1.5), expand=c(0, 0)) + 
+  labs(x="Length of protection (months)", y="Density") + 
+  theme_bw() + 
+  theme(panel.background=element_blank(), panel.border=element_blank(), 
+        axis.line.x.bottom = element_line(colour="black"), 
+        axis.line.y.left = element_line(colour="black"), 
+        panel.grid=element_blank(), plot.margin = unit(c(0.5, 0.5, 0.1, 0.5), "cm"), 
+        axis.text=element_text(size=8, colour="black"), axis.title=element_text(size=8, colour="black"))
+
+print(period_maternal_immunity)
+```
+We see that maternally-acquired passive immunity lasts for 7.5 to 10 months. 
+
+### Age-specific seropositivity
+
+Let's also retrieve the mean estimates for seropositivity in each age group for each state. 
+
+```{r eval=FALSE}
+states <- sort(unique(pull(ng1_rub_sero_data, state))) 
+all_seropos_estimates <- rstan::extract(MCMC_piecewise_lambda_fit)[["p"]]
+seropos_list <- list()
+state_pos <- 1
+for (this_state in states) {
+  ages <- ng1_rub_sero_data %>% filter(state==this_state) %>% pull(age)
+  seropos <- colMeans(all_seropos_estimates[, state_pos:(state_pos+length(ages)-1)])
+  seropos <- data.frame(age=ages, seropos=seropos)
+  seropos_list[[this_state]] <- seropos
+  state_pos <- state_pos + length(ages)
+}
+saveRDS(seropos_list, file=file.path(MCMC_ESTIMATES_FOLDER,
+                                     "MCMC_piecewise_lambda_fit_mean_seropositivity_estimates.rds"))
+```
+
+Next, let's compute the proportion of susceptibility among women of childbearing age. 
+
+```{r eval=FALSE}
+### computes the area under the curve for the function of the probability 
+### that an individual is susceptible at age a
+compute_sus_prob_integral <- function(state_lambdas, agegrps, delta, left_endpoint, right_endpoint) {
+  f <- function(x) {
+    return(compute_prob_susceptible(lambdas=state_lambdas, a=x, agegrps=agegrps, delta=delta))
+  }
+  vec_f <- Vectorize(FUN=f, vectorize.args="x")
+  sus_prob_integral <- integrate(vec_f, lower=left_endpoint, upper=right_endpoint)$value
+  return(sus_prob_integral)
+}
+
+# compute the proportion of susceptible among women of childbearing age. 
+states <- unique(pull(ng1_fpop, state))
+state_sus_prob_list <- list()
+state_total_sus_prob_list <- list()
+for (this_state in states) {
+  print(this_state)
+  state_ng1_fpop <- ng2_pop %>%
+    filter(state==this_state) %>%
+    group_by(agegrp) %>%
+    summarise(n=sum(n, na.rm=TRUE), .groups="keep") %>% 
+    as.data.frame() %>%
+    mutate(agegrp=as.numeric(as.character(agegrp))) %>%
+    filter(agegrp>=15, agegrp<45) %>% 
+    arrange(-desc(agegrp))
+  left_endpoints <- state_ng1_fpop %>% pull(agegrp)
+  avg_sus_probs_list <- list()
+  total_avg_sus_prob_list <- list()
+  for (ii in 1:ncol(state_lambda_data[[this_state]])) {
+    avg_sus_probs <- sapply(seq_along(left_endpoints), 
+                            function(x) compute_sus_prob_integral(state_lambdas=state_lambda_data[[this_state]][ii, ], 
+                                                                  agegrps=c(0, 3, 15), 
+                                                                  delta=omegas[ii], 
+                                                                  left_endpoint=left_endpoints[x], 
+                                                                  right_endpoint=left_endpoints[x]+5))/5
+    avg_sus_probs_list[[ii]] <- avg_sus_probs*state_ng1_fpop$n/state_ng1_fpop$n*100
+    total_avg_sus_prob_list[[ii]] <- sum(avg_sus_probs*state_ng1_fpop$n)/sum(state_ng1_fpop$n)*100
+  }
+  avg_sus_probs <- do.call(rbind, avg_sus_probs_list)
+  total_avg_sus_probs <- do.call(c, total_avg_sus_prob_list)
+  state_sus_prob_list[[this_state]] <- avg_sus_probs
+  state_total_sus_prob_list[[this_state]] <- total_avg_sus_probs
+}
+saveRDS(state_total_sus_prob_list, 
+        file=file.path(MCMC_ESTIMATES_FOLDER, 
+                       "MCMC_piecewise_lambda_fit_percent_susceptible_childbearing_ages2.rds"))
+saveRDS(state_sus_prob_list, 
+        file=file.path(MCMC_ESTIMATES_FOLDER, 
+                       "MCMC_piecewise_lambda_fit_percent_susceptible_childbearing_ages1.rds"))
+```
+
+Reading in the estimates for the percentage of women of child-bearing age that are suceptible to infection. 
+
+```{r}
+state_total_sus_prob_list <- readRDS(
+        file=file.path(MCMC_ESTIMATES_FOLDER, 
+                       "MCMC_piecewise_lambda_fit_percent_susceptible_childbearing_ages2.rds"))
+state_sus_prob_list <- readRDS(
+        file=file.path(MCMC_ESTIMATES_FOLDER, 
+                       "MCMC_piecewise_lambda_fit_percent_susceptible_childbearing_ages1.rds"))
+```
+
+Let's plot the percentage of women of childbearing age (15-45 years) estimated to be susceptible to infection (i.e. no history of rubella infection). 
+
+```{r}
+# organize the data
+state_order <- names(state_sus_prob_list)
+state_sus_prob <- do.call(rbind, state_total_sus_prob_list) %>% 
+  data.frame() %>% 
+  cbind(state=state_order, .) %>% 
+  gather(key="sim", value="percentage_susceptible", 2:ncol(.)) %>% 
+  group_by(state) %>% 
+  summarise(mean=mean(percentage_susceptible), 
+            l90=quantile(percentage_susceptible, 0.05), 
+            u90=quantile(percentage_susceptible, 0.95), .groups="keep") %>% 
+  as.data.frame()
+state_sus_prob[which(state_sus_prob=="Federal Capital Territory"), "state"] <- "FCT"
+
+# plot
+percentage_seroneg_plot <- ggplot(data=state_sus_prob) + 
+  geom_errorbar(aes(x=state, ymin=l90, ymax=u90), width=0.2) +
+  geom_point(aes(x=state, y=mean), fill="black", color="black", shape=21, size=1) + 
+  scale_y_continuous(limits=c(0, 15), breaks=seq(0, 15, 3)) + 
+  labs(y="Percentage of women of childbearing age\nwith no past rubella infections (%)") + 
+  theme_bw() +
+  theme(axis.title.x=element_blank(), axis.text.x=element_text(size=8, angle=90, vjust=0.4, hjust=1, color="black"), 
+        axis.title.y=element_text(color="black", size=8), 
+        axis.text.y=element_text(colour="black", size=8)) + 
+  theme(plot.margin=unit(c(0.5, 0.1, 0.1, 0.9), "cm"), 
+        panel.grid.minor=element_blank(), panel.grid.major.x=element_blank(), 
+        panel.background=element_blank(), panel.border=element_blank(), 
+        axis.line.x.bottom = element_line(colour="black"), 
+        axis.line.y.left = element_line(colour="black"))
+
+print(percentage_seroneg_plot)
+```
+
+Next, let's compute the number of pregnant women at risk of infection per year. 
+
+```{r}
+# age-specific fertility rate data
+ng1_asfr_data <- ng1_fertility_data %>% 
+    gather(key="agegrp", value="asfr", 2:ncol(.)) %>% 
+    mutate(agegrp=gsub("\\.", "-", gsub("X", "", agegrp)))
+ng1_fpop <- ng2_pop %>% 
+  filter(gender=="f") %>% 
+  group_by(state, agegrp) %>% 
+  summarise(n=sum(n, na.rm=TRUE), .groups="keep") %>%
+  ungroup() %>% 
+  mutate(agegrp=as.numeric(as.character(agegrp))) %>% 
+  mutate(agegrp=paste0(agegrp, "-", agegrp+4))
+ng1_sus_prob <- purrr::map(names(state_sus_prob_list), 
+                                 function(x) {
+                                   return(data.frame(state=x, 
+                                                     sim=1:nrow(state_sus_prob_list[[x]]), 
+                                                     state_sus_prob_list[[x]]))
+                                 }) %>% 
+  do.call(rbind, .) %>% 
+  setNames(c("state", "sim", "15-19", "20-24", "25-29", "30-34", "35-39", "40-44")) %>%
+  gather(key="agegrp", value="percent_sus", 3:ncol(.))
+ng1_yearly_preg_at_risk <- ng1_asfr_data %>% 
+  inner_join(ng1_fpop, by=c("state", "agegrp")) %>%
+  mutate(yearly_preg=n*asfr) %>% 
+  right_join(ng1_sus_prob, by=c("state", "agegrp")) %>% 
+  group_by(state, sim) %>% 
+  summarise(preg_at_risk=sum(yearly_preg*percent_sus/100), .groups="keep") %>% 
+  ungroup() %>% group_by(state) %>% 
+  summarise(mean=mean(preg_at_risk), 
+            l90=quantile(preg_at_risk, 0.05), 
+            u90=quantile(preg_at_risk, 0.95), .groups="keep") %>% 
+  ungroup() %>%
+  left_join(ng1_zone_mapping, by="state")
+```
+
+Let's plot the number of pregnant women at risk of rubella infection per year in each state. 
+
+```{r}
+zone_colors <- brewer.pal(8, "Pastel1")[c(1:5, 7)]
+zone_order <- c("North Central", "North East", "North West", "South East", "South South", "South West")
+ng1_yearly_preg_at_risk[which(ng1_yearly_preg_at_risk=="Federal Capital Territory"), "state"] <- "FCT"
+pregnant_women_at_risk_plot <- ggplot(data=ng1_yearly_preg_at_risk) + 
+  geom_col(aes(x=state, y=mean, fill=zone), color="black") + 
+  geom_errorbar(aes(x=state, ymin=l90, ymax=u90), width=0.2) +
+  scale_y_continuous(breaks=seq(0, 25000, 5000), limits=c(0, 25000), labels = comma_format(big.mark = ",",
+                                           decimal.mark = "."), expand=c(0, 0)) + 
+  labs(y="Number of pregnant women at risk of infection") + 
+  scale_fill_manual(breaks=zone_order, values=zone_colors, guide=guide_legend(ncol=1)) + 
+  theme_bw() +
+  theme(axis.title.x=element_blank(), axis.text.x=element_text(size=8, angle=90, vjust=0.4, hjust=1, color="black"), 
+        axis.title.y=element_text(size=8, color="black"), legend.title=element_blank(), 
+        legend.text=element_text(size=8), 
+        axis.text.y=element_text(colour="black", size=8)) +  
+  theme(legend.position = c(0.94, 0.9), legend.key.size=unit(0.3, "cm"), 
+        legend.background = element_blank(),
+    legend.box.background = element_blank()) + 
+  theme(plot.margin=unit(c(0.5, 0.1, 0.1, 0.6), "cm"), 
+        panel.grid.minor=element_blank(), panel.grid.major.x=element_blank(), 
+        panel.background=element_blank(), panel.border=element_blank(), 
+        axis.line.x.bottom = element_line(colour="black"), 
+        axis.line.y.left = element_line(colour="black"))
+
+print(pregnant_women_at_risk_plot)
+```
+
+Let's combine the two above plots. 
+
+```{r}
+pA <- percentage_seroneg_plot + theme(axis.text.x=element_blank())
+pAB <- cowplot::plot_grid(pA, pregnant_women_at_risk_plot, ncol=1, labels=c("(a)", "(b)"), 
+                          label_size=10, label_fontface = "plain", label_fontfamily="serif", rel_heights=c(1, 1.2))
+scale_factor <- 0.5
+pdf(file=file.path(FIGURES_FOLDER, "rubella_epi_women_childbearing_age.pdf"), w=8.5, h=11*scale_factor)
+print(pAB)
+a <- dev.off()
+```
+
+### Mean age of infection
+
+Next, let's compute the mean age of infection in each state. 
+
+```{r eval=FALSE}
+### computes the area under the curve for the function of the probability 
+### that an individual is susceptible at age a
+compute_sus_prob_integral <- function(state_lambdas, agegrps, delta, left_endpoint, right_endpoint) {
+  f <- function(x) {
+    return(compute_prob_susceptible(lambdas=state_lambdas, a=x, agegrps=agegrps, delta=delta))
+  }
+  vec_f <- Vectorize(FUN=f, vectorize.args="x")
+  sus_prob_integral <- integrate(vec_f, lower=left_endpoint, upper=right_endpoint)$value
+  return(sus_prob_integral)
+}
+
+# compute the mean age of infection in each age group
+states <- unique(pull(ng1_fpop, state))
+state_mean_age_inf_list <- list()
+for (this_state in states) {
+  print(this_state)
+  mean_age_inf_list <- list()
+  for (ii in 1:ncol(state_lambda_data[[this_state]])) {
+    mean_age_inf <- compute_sus_prob_integral(state_lambdas=state_lambda_data[[this_state]][ii, ], 
+                                              agegrps=c(0, 3, 15), 
+                                              delta=omegas[ii], 
+                                              left_endpoint=0, 
+                                              right_endpoint=Inf)
+    mean_age_inf_list[[ii]] <- mean_age_inf
+  }
+  state_mean_age_inf_list[[this_state]] <- do.call(c, mean_age_inf_list) 
+}
+ng1_mean_age_inf <- do.call(cbind, state_mean_age_inf_list) %>% 
+  as.data.frame()
+saveRDS(ng1_mean_age_inf, 
+        file=file.path(MCMC_ESTIMATES_FOLDER, 
+                       "MCMC_piecewise_lambda_fit_mean_age_inf_estimates.rds"))
+```
+
+Reading in the estimates for the mean age of infection in each state. 
+
+```{r}
+ng1_mean_age_inf <- readRDS(
+        file=file.path(MCMC_ESTIMATES_FOLDER, 
+                       "MCMC_piecewise_lambda_fit_mean_age_inf_estimates.rds"))
+```
+
+Let's plot the distribution of the mean age of infection in each state. 
+
+```{r}
+mean_age_inf_data <- ng1_mean_age_inf %>%
+  lapply(function(x) c(mean(x), l90=quantile(x, 0.05), u90=quantile(x, 0.95))) %>% 
+  do.call(rbind, .) %>%
+  as.data.frame() %>% 
+  cbind(state=names(ng1_mean_age_inf), .) %>% 
+  setNames(c("state", "mean", "l90", "u90")) %>% 
+  left_join(ng1_zone_mapping, by="state")
+
+zone_colors <- brewer.pal(8, "Pastel1")[c(1:5, 7)]
+zone_order <- c("North Central", "North East", "North West", "South East", "South South", "South West")
+mean_age_inf_data[which(mean_age_inf_data=="Federal Capital Territory"), "state"] <- "FCT"
+mean_age_inf_plot <- ggplot(data=mean_age_inf_data) + 
+  geom_col(aes(x=state, y=mean, fill=zone), color="black") + 
+  geom_errorbar(aes(x=state, ymin=l90, ymax=u90), width=0.2) +
+  scale_y_continuous(expand=c(0, 0)) + 
+  scale_fill_manual(breaks=zone_order, values=zone_colors, guide=guide_legend(ncol=1)) + 
+  labs(y="Mean age of infection (years)") + 
+  theme_bw() +
+  theme(axis.title.x=element_blank(), axis.text.x=element_text(size=8, angle=90, vjust=0.4, hjust=1, color="black"), 
+        axis.title.y=element_text(size=8, color="black"), legend.title=element_blank(), 
+        legend.text=element_text(size=8)) +  
+  theme(legend.position = c(0.93, 0.92), legend.key.size=unit(0.23, "cm"), 
+        legend.background = element_blank(),
+    legend.box.background = element_blank()) + 
+  theme(plot.margin=unit(c(0.5, 0, 0.1, 0.5), "cm"), 
+        panel.grid.minor=element_blank(), panel.grid.major.x=element_blank(), 
+        panel.background=element_blank(), panel.border=element_blank(), 
+        axis.line.x.bottom = element_line(colour="black"), 
+        axis.line.y.left = element_line(colour="black"))
+
+print(mean_age_inf_plot)
+```
+
+### Basic reproductive number
+
+Now, let's attempt to estimate $R_0$. First, we need to compute the initial age distribution in each population. 
+
+```{r}
+compute_initial_population <- function(pop_data, this_state, agegrps=c(0, 3, 15)) {
+  state_pop_data <- pop_data %>% 
+    filter(state==this_state) %>% 
+    group_by(state, agegrp) %>% 
+    summarise(n=sum(n, na.rm=TRUE), .groups="keep") %>% 
+    as.data.frame() %>% 
+    mutate(agegrp=as.numeric(as.character(agegrp)))
+  age5_pop <- state_pop_data[which(state_pop_data$agegrp==1), "n"]
+  split_data <- data.frame(state=this_state, 
+                           agegrp=1:4, 
+                           n=age5_pop/4)
+  state_pop_data <- state_pop_data %>% 
+    filter(agegrp!=1) %>% 
+    rbind(., split_data) %>% 
+    arrange(-desc(agegrp)) %>% 
+    mutate(interval=findInterval(agegrp, agegrps)) %>% 
+    group_by(state, interval) %>%
+    summarise(n=sum(n), .groups="keep") %>% 
+    mutate(agegrp=agegrps[interval]) %>%
+    as.data.frame()
+  return(state_pop_data)
+}
+states <- unique(pull(ng1_rub_sero_data, state))
+init_pop_list <- lapply(states, function(x) compute_initial_population(pop_data=ng2_pop, this_state=x)) 
+names(init_pop_list) <- states
+```
+
+Now, we can estimate the $R_0$ in each state. 
+
+```{r eval=FALSE}
+agegrps <- c(0, 3, 15, Inf)
+contact_mat <- matrix(c(1, 1, 3, 1, 2, 3, 3, 3, 3), nrow=3, ncol=3, byrow=TRUE)
+deltas <- rstan::extract(MCMC_piecewise_lambda_fit)[["delta"]]
+states <- unique(pull(ng1_rub_sero_data, state))
+f <- function(this_state) {
+  print(this_state)
+  lambda_data <- state_lambda_data[[this_state]]
+  N <- sum(ng2_pop[which(ng2_pop$state==ifelse(this_state=="FCT", "Federal Capital Territory", this_state)), "n"], na.rm=TRUE)
+  initN <- init_pop_list[[ifelse(this_state=="FCT", "Federal Capital Territory", this_state)]] %>% 
+    arrange(-desc(agegrp)) %>% 
+    pull(n)
+  mu <- ng0_selected_mortality_rates
+  
+  L <- compute_avg_life_exp(mu=mu, agegrps=agegrps[-length(agegrps)])
+  equN <- sapply(1:(length(agegrps)-1), function(x)
+                 compute_avg_life_exp(mu, agegrps=agegrps[-length(agegrps)], interval=c(agegrps[x], agegrps[x+1])))/L*N
+  M_mat <- compute_M_mat(mu=mu, contact_mat=contact_mat, agegrps=agegrps)
+  number_samples <- 2000
+  for (tt in 1:number_samples) {
+    beta_estimate <- compute_betas(lambdas=lambda_data[tt, ], mus=mu, delta=deltas[tt], agegrps=agegrps, 
+                                   initN=initN, equN=equN, N=N, L=L, D=10/365, contact_mat=contact_mat)
+    saveRDS(beta_estimate, file=file.path(MCMC_ESTIMATES_FOLDER, "R0_beta_estimates", "tmp", paste0(this_state, "_beta_estimate", tt, ".rds")))
+  }
+  state_beta_estimates <- do.call(rbind, lapply(1:number_samples, function(x) readRDS(file.path(MCMC_ESTIMATES_FOLDER, 
+                                                                                              "R0_beta_estimates", "tmp", paste0(this_state, "_beta_estimate", x, ".rds")))))
+  state_R0_estimates <- sapply(1:nrow(state_beta_estimates), function(x) 
+    compute_R0(agegrps=agegrps, initN=initN, equN=equN, N=N, L=L, D=10/365, contact_mat=contact_mat, 
+               betas=state_beta_estimates[x, ], M_mat=M_mat))
+  state_estimates <- cbind(state_R0_estimates, state_beta_estimates)
+  file_name <- paste0(this_state, "_R0_beta_estimates.rds")
+  saveRDS(state_estimates, file=file.path(MCMC_ESTIMATES_FOLDER, "R0_beta_estimates", file_name))
+  gc()
+}
+{parallel::mclapply(as.list(states), f, mc.cores=3)}
+state_estimates <- lapply(states, function(x) readRDS(file=file.path(MCMC_ESTIMATES_FOLDER, 
+                                                                     "R0_beta_estimates", 
+                                                                     paste0(x, "_R0_beta_estimates.rds"))))
+names(state_estimates) <- states
+R0_estimates <- do.call(cbind, lapply(states, function(x) state_estimates[[x]][, 1])) 
+colnames(R0_estimates) <- states
+beta_estimates_list <- lapply(states, function(x) state_estimates[[x]][, -1])
+names(beta_estimates_list) <- as.character(states)
+mu <-  ng0_selected_mortality_rates %>% 
+  rep(., each=length(states)) %>% 
+  matrix(, nrow=length(states), ncol=3) %>% 
+  as.data.frame() %>% 
+  setNames(c("mu1", "mu2", "mu3")) %>% 
+  mutate(state=states) %>% 
+  select(state, dplyr::everything())
+saveRDS(R0_estimates,
+        file=file.path(MCMC_ESTIMATES_FOLDER,
+                       "MCMC_piecewise_lambda_fit_R0_estimates.rds"))
+saveRDS(beta_estimates_list,
+        file=file.path(MCMC_ESTIMATES_FOLDER,
+                       "MCMC_piecewise_lambda_fit_beta_estimates.rds"))
+saveRDS(list(agegrps=agegrps, contact_mat=contact_mat),
+        file=file.path(MCMC_ESTIMATES_FOLDER,
+                       "MCMC_piecewise_lambda_fit_contact_structure.rds"))
+saveRDS(mu,
+        file=file.path(MCMC_ESTIMATES_FOLDER,
+                       "MCMC_piecewise_lambda_fit_mu_estimates.rds"))
+```
+
+Reading in the $R_0$ estimates folder: 
+
+```{r}
+R0_estimates <- readRDS(
+  file.path(MCMC_ESTIMATES_FOLDER,
+            "MCMC_piecewise_lambda_fit_R0_estimates.rds"))
+```
+
+## National-level estimation
+
+Next, we perform the same analysis but at the national level.
+
+### Force of infection
+
+First, we estimate the force of infection in each state for the three age groups (i.e. 0-3 years, 3-15 years and 15+ years). We also simultaneously estimate the rate of loss of materally-derived passive immunity in infants. 
+
+```{r}
+agegrps <- c(0, 3, 15)
+ng0_sero_data <- ng1_rub_sero_data %>% 
+  group_by(age) %>% 
+  summarise(positive=sum(positive), tested=sum(tested), .groups="keep") %>% 
+  ungroup() %>% 
+  arrange(-desc(age)) %>% 
+  mutate(state="Nigeria")
+N <- nrow(ng0_sero_data)
+pos <- ng0_sero_data$positive
+tested <- ng0_sero_data$tested
+age <- ng0_sero_data$age
+num_agegrp <- length(agegrps)
+agegrp <- agegrps
+input_data <- list(N=N, pos=pos, num_agegrp=num_agegrp, tested=tested, age=age, 
+                   num_agegrp=num_agegrp, agegrp=agegrp)
+init <- list(list(lambda=rnorm(num_agegrp, 0.1, 0.01)), 
+             list(lambda=rnorm(num_agegrp, 0.11, 0.01)),
+             list(lambda=rnorm(num_agegrp, 0.12, 0.01)))
+```
+
+Fitting the data...
+```{r eval=FALSE}
+ng0_MCMC_piecewise_lambda_fit <- stan(file=file.path(HELPER_SCRIPTS_FOLDER, "national_piecewise_lambda_fit.stan"), 
+                                      data = input_data, chains=3, init=init,
+                                      warmup=2000, iter=4000, cores = 3,
+                                      control = list(adapt_delta = 0.99), seed=100)
+saveRDS(ng0_MCMC_piecewise_lambda_fit, 
+        file=file.path(MCMC_FITTING_OUTPUT_FOLDER, 
+                       "ng0_MCMC_piecewise_lambda_fit.rds"))
+```
+
+Loading the fitting data...
+
+```{r}
+ng0_MCMC_piecewise_lambda_fit <- readRDS(file=file.path(MCMC_FITTING_OUTPUT_FOLDER, 
+                                                        "ng0_MCMC_piecewise_lambda_fit.rds"))
+```
+
+Let's plot the force of infection function:
+
+```{r}
+ng0_lambda_data <- rstan::extract(ng0_MCMC_piecewise_lambda_fit)[["lambda"]]
+saveRDS(ng0_lambda_data, file.path(MCMC_ESTIMATES_FOLDER, 
+                                   "ng0_MCMC_piecewise_lambda_fit_lambda_estimates.rds"))
+foi_distribution_plot("Nigeria", ng0_lambda_data, age_groups=c(0, 3, 15, 45))
+```
+
+Let's see whether the estimated force of infection estimates can replicate the actual data. 
+
+```{r}
+post_pred_dist_plot("Nigeria", MCMC_fit=ng0_MCMC_piecewise_lambda_fit, sero_data=ng0_sero_data, states="Nigeria")
+```
+
+### Average period of materally-derived passive immunity
+
+Let's also retrieve and save the estimated rate of loss of maternally-acquired passive immunity for rubella across Nigeria. 
+
+```{r}
+omegas <- rstan::extract(ng0_MCMC_piecewise_lambda_fit)[["delta"]]
+saveRDS(omegas, file=file.path(MCMC_ESTIMATES_FOLDER,
+                               "ng0_MCMC_piecewise_lambda_fit_omegas.rds"))
+```
+
+### Age-specific seropositivity
+
+Let's also retrieve the mean estimates for seropositivity in each age group for each state. 
+
+```{r}
+ng0_seropos_estimates <- rstan::extract(ng0_MCMC_piecewise_lambda_fit)[["p"]]
+ages <- ng0_sero_data$age
+ng0_seropos <- colMeans(ng0_seropos_estimates)
+ng0_seropos <- data.frame(age=ages, seropos=ng0_seropos)
+saveRDS(ng0_seropos, file=file.path(MCMC_ESTIMATES_FOLDER,
+                                    "ng0_MCMC_piecewise_lambda_fit_mean_seropositivity_estimates.rds"))
+```
+
+### Basic reproductive number
+
+Now, let's attempt to estimate $R_0$. First, we need to compute the initial age distribution in each population. 
+
+```{r}
+ng0_init_pop <- do.call(rbind, init_pop_list) %>% 
+  as.data.frame() %>% 
+  group_by(interval, agegrp) %>% 
+  summarise(n=sum(n), .groups="keep") %>% 
+  as.data.frame()
+```
+
+Now, we can estimate the $R_0$ in each state. 
+
+```{r eval=FALSE}
+agegrps <- c(0, 3, 15, Inf)
+contact_mat <- matrix(c(1, 1, 3, 1, 2, 3, 3, 3, 3), nrow=3, ncol=3, byrow=TRUE)
+deltas <- rstan::extract(ng0_MCMC_piecewise_lambda_fit)[["delta"]]
+N <- sum(ng0_init_pop$n)
+initN <- ng0_init_pop$n
+mu <- ng0_selected_mortality_rates
+L <- compute_avg_life_exp(mu=mu, agegrps=agegrps[-length(agegrps)])
+equN <- sapply(1:(length(agegrps)-1), function(x)
+  compute_avg_life_exp(mu, agegrps=agegrps[-length(agegrps)], interval=c(agegrps[x], agegrps[x+1])))/L*N
+M_mat <- compute_M_mat(mu=mu, contact_mat=contact_mat, agegrps=agegrps)
+beta_estimates_list <- list()
+estimate_beta <- function(tt) {
+  beta_estimate <- compute_betas(lambdas=ng0_lambda_data[tt, ], mus=mu, 
+                                 delta=deltas[tt], agegrps=agegrps, 
+                                 initN=initN, equN=equN, N=N, L=L, D=10/365, 
+                                 contact_mat=contact_mat)
+  saveRDS(beta_estimate, file=file.path(MCMC_ESTIMATES_FOLDER, "R0_beta_estimates", 
+                                        "tmp", paste0("Nigeria", "_beta_estimate", tt, ".rds")))
+}
+number_samples <- 2000
+{parallel::mclapply(as.list(1:number_samples), estimate_beta, mc.cores=3)}
+ng0_beta_estimates <- do.call(rbind, lapply(1:number_samples, function(x) 
+  readRDS(file.path(MCMC_ESTIMATES_FOLDER, "R0_beta_estimates", "tmp", 
+                    paste0("Nigeria", "_beta_estimate", x, ".rds"))))) %>% 
+  as.data.frame() %>% 
+  setNames(c("beta1", "beta2", "beta3"))
+ng0_R0_estimates <- sapply(1:nrow(ng0_beta_estimates), function(x) 
+  compute_R0(agegrps=agegrps, initN=initN, equN=equN, N=N, L=L, D=10/365, contact_mat=contact_mat, 
+             betas=as.numeric(ng0_beta_estimates[x, ]), M_mat=M_mat))
+
+saveRDS(ng0_R0_estimates,
+        file=file.path(MCMC_ESTIMATES_FOLDER,
+                       "ng0_MCMC_piecewise_lambda_fit_R0_estimates.rds"))
+saveRDS(ng0_beta_estimates,
+        file=file.path(MCMC_ESTIMATES_FOLDER,
+                       "ng0_MCMC_piecewise_lambda_fit_beta_estimates.rds"))
+```
+
+## Summary figures
+
+In this section, we generate additional summary figures.
+
+Let's start by plotting the force of infection functions for each state. 
+
+```{r}
+states <- unique(pull(ng1_rub_sero_data, state)) %>% sort()
+plots <- purrr::map(states, function(x) foi_distribution_plot(this_state=x, 
+                                                              lambdas=state_lambda_data[[x]], 
+                                                              age_groups=c(0, 3, 15, 45), 
+                                                              ymax=0.5))
+
+pdf(file.path(FIGURES_FOLDER, "foi_distribution_plot.pdf"), w=8.5, h=11)
+plots_per_page <- 12
+groupings <- split(seq_along(plots), ceiling(seq_along(plots)/plots_per_page))
+for (ii in seq_along(groupings)) {
+  plots_subset <- plots[groupings[[ii]]]
+  num_plots_subset <- length(plots_subset)
+  if (num_plots_subset<plots_per_page) {
+    for (jj in 1:(plots_per_page-num_plots_subset)) {
+      plots_subset[[jj+num_plots_subset]] <- cowplot::ggdraw()
+    }
+  }
+  print(cowplot::plot_grid(plotlist=plots_subset, ncol=3))
+}
+a <- dev.off()
+```
+
+Next, let's have a look at the posterior predictive distributions of the seroprevalence data. 
+
+```{r}
+all_states <- unique(pull(ng1_rub_sero_data, state)) %>% sort()
+all_states <- c(all_states, "Nigeria")
+plots_per_page <- 24
+groupings <- split(seq_along(all_states), ceiling(seq_along(all_states)/plots_per_page))
+for (ii in seq_along(groupings)) {
+  plots <- post_pred_dist_plot(these_states=all_states[groupings[[ii]]], 
+                               MCMC_fit=MCMC_piecewise_lambda_fit,
+                               sero_data=ng1_rub_sero_data, 
+                               ng0_MCMC_fit=ng0_MCMC_piecewise_lambda_fit, 
+                               ng0_sero_data=ng0_sero_data, 
+                               states=setdiff(all_states, "Nigeria"))
+  
+  scale_factor <- length(states[groupings[[ii]]])/plots_per_page*0.8
+  file_name <- paste0("post_pred_dist_plot", ii, ".pdf")
+  pdf(file=file.path(FIGURES_FOLDER, file_name), w=8, h=11*scale_factor)
+  print(plots)
+  a <- dev.off()
+}
+```
+
+Let's create a plot for the distribution of the mean force of infection function in each state. 
+
+```{r fig.height=4, fig.width=4}
+state_lambda_summaries <- state_lambda_data %>%
+  lapply(., function(x) apply(x, 2, function(x) mean(x))) %>% 
+  do.call(rbind, .) %>% 
+  as.data.frame() %>% 
+  setNames(c("lambda1", "lambda2", "lambda3")) %>% 
+  mutate(state=names(state_lambda_data)) %>% 
+  select(state, dplyr::everything()) %>% 
+  gather(key="lambda", value="mean", 2:ncol(.)) %>% 
+  mutate(lambda=factor(lambda, c("lambda1", "lambda2", "lambda3")))
+ng0_lambda_summary <- ng0_lambda_data %>% 
+  as.data.frame() %>%
+  setNames(c("lambda1", "lambda2", "lambda3")) %>% 
+  gather(key="agegrp", value="lambda", 1:ncol(.)) %>% 
+  group_by(agegrp) %>% 
+  summarise(mean=mean(lambda), 
+            l95=quantile(lambda, 0.05), 
+            u95=quantile(lambda, 0.95), .groups="keep") %>% 
+  as.data.frame() %>% 
+  mutate(agegrp=factor(agegrp, c("lambda1", "lambda2", "lambda3")))
+
+lambda_summary_plot <- ggplot(data=state_lambda_summaries) + 
+  geom_boxplot(mapping=aes(x=lambda, y=mean), fill="#8DA0CB") + 
+  labs(y=expression(paste("Mean FOI (", year^{"-1"}, ")")), x="Age class (years)") +  
+  scale_y_continuous(limits=c(0, 0.4), breaks=seq(0, 0.4, 0.1)) +
+  scale_x_discrete(labels=c("0-3", "3-15", "15+")) + 
+  theme_bw() + 
+  theme(axis.text=element_text(size=8, color="black"), axis.title=element_text(size=8, color="black")) + 
+  theme(plot.margin=unit(c(0.5, 0.5, 0, 0.5), "cm"), 
+        panel.grid=element_blank(), 
+         panel.background=element_blank(), panel.border=element_blank(), 
+        axis.line.x.bottom = element_line(colour="black"), 
+        axis.line.y.left = element_line(colour="black"))
+
+print(lambda_summary_plot)
+```
+
+Let's plot the estimates of the effective contact rates (i.e. $\beta$). 
+
+```{r}
+beta_estimates_list <- readRDS(file=file.path(MCMC_ESTIMATES_FOLDER,
+                                              "MCMC_piecewise_lambda_fit_beta_estimates.rds"))
+num_beta <- 3
+states <- unique(pull(ng1_rub_sero_data, state)) %>% sort()
+org_beta_data <- list()
+jj <- 1
+for (ii in 1:num_beta) {
+  for (this_state in states) {
+    beta_values <- beta_estimates_list[[this_state]][, ii]/365
+    mean_beta <- mean(beta_values)
+    l90_beta <- quantile(beta_values, 0.05)
+    u90_beta <- quantile(beta_values, 0.95)
+    state_data <- data.frame(state=this_state, beta=paste0("beta", ii), mean=mean_beta, l90=l90_beta, u90=u90_beta)
+    org_beta_data[[jj]] <- state_data
+    jj <- jj + 1
+  }
+}
+org_beta_data <- do.call(rbind, org_beta_data) %>% 
+  as.data.frame() %>% 
+  left_join(ng1_zone_mapping, by="state")
+org_beta_data[which(org_beta_data$state=="Federal Capital Territory"), "state"] <- "FCT"
+
+zone_colors <- brewer.pal(9, "Set1")[c(1:5, 7)]
+zone_order <- c("North Central", "North East", "North West", "South East", "South South", "South West")
+strip_labels <- c(expression(paste(beta)))
+beta_estimates_summary_plot <- ggplot(data=org_beta_data) + 
+  geom_col(mapping=aes(x=state, y=mean*10^6), color="black", fill="#8DA0CB") + 
+  geom_errorbar(mapping=aes(x=state, ymin=l90*10^6, ymax=u90*10^6), width=0.5) + 
+  scale_y_continuous(limits=c(0, 0.42), breaks=seq(0, 0.4, 0.1), expand=c(0, 0)) + 
+  labs(y="Effective contact rate\n(per 1 mil. susceptibles per day)") +
+  theme(axis.text.x=element_text(angle=90, hjust=1, vjust=0.5, color="black", size=9), axis.title.x=element_blank(), 
+        axis.text.y=element_text(color="black", size=9), 
+        axis.title.y=element_text(color="black", size=9), 
+        panel.border=element_rect(colour="black", fill=NA), strip.placement="outside", 
+        panel.background=element_rect(fill="white"), panel.grid.major.y=element_line(colour="grey"), 
+        strip.background = element_blank(), strip.text=element_blank()) + 
+  theme(panel.border=element_blank(), panel.background=element_blank(), 
+        axis.line.x.bottom=element_line(colour="black"), axis.line.y.left=element_line(colour="black"), 
+        plot.margin=margin(0.2, 0.2, 0.2, 0.2, unit="cm")) + 
+  facet_wrap(~beta, ncol=1, strip.position="right", labeller=labeller(beta=c("beta1"="Group 1", "beta2"="Group 2", "beta3"="Group 3"))) 
+
+scale_factor <- 0.5
+pA <- beta_estimates_summary_plot
+pdf(file=file.path(FIGURES_FOLDER, "state_beta_plot.pdf"), w=8.5, h=11*scale_factor)
+print(pA)
+a <- dev.off()
+
+print(beta_estimates_summary_plot)
+```
+
+Now, let's plot the $R_0$ estimates along with the $90\%$ credible interval for each state. 
+
+```{r}
+ng0_R0_estimates <- readRDS(file.path(MCMC_ESTIMATES_FOLDER,
+                                      "ng0_MCMC_piecewise_lambda_fit_R0_estimates.rds"))
+state_R0_estimates <- readRDS(file.path(MCMC_ESTIMATES_FOLDER,
+                                        "MCMC_piecewise_lambda_fit_R0_estimates.rds"))
+ng0_R0_summary <- ng0_R0_estimates %>% 
+  data.frame(R0=.) %>% 
+  mutate(state="Nigeria") %>% 
+  group_by(state) %>% 
+  summarise(mean=mean(R0), 
+            l90=quantile(R0, 0.05), 
+            u90=quantile(R0, 0.95), .groups="keep") %>% 
+  as.data.frame() %>% 
+  mutate(geometry=NA)
+  
+states <- unique(pull(ng1_rub_sero_data, state)) %>% sort()
+states[which(states=="Federal Capital Territory")] <- "FCT"
+state_R0_summaries <- state_R0_estimates %>% 
+  apply(2, function(x) c(mean(x), as.numeric(quantile(x, c(0.05, 0.95))))) %>% 
+  t() %>%
+  cbind(states, .) %>%
+  as.data.frame() %>%
+  setNames(c("state", "mean", "l90", "u90")) %>%
+  mutate(mean=as.numeric(mean), l90=as.numeric(l90), u90=as.numeric(u90)) %>% 
+  right_join(mutate(ng1, state=ifelse(state=="Federal Capital Territory", "FCT", state)), 
+             by="state") %>%
+  rbind(., ng0_R0_summary)
+```
+
+```{r}
+state_order <- c(states, "Nigeria")
+state_R0_summaries %<>% mutate(state=factor(state, state_order))
+
+state_R0_summary_plot <- ggplot() + 
+  geom_errorbar(data=state_R0_summaries, aes(x=state, ymin=l90, ymax=u90, color=state), width=0.2) +
+  geom_point(data=state_R0_summaries, aes(x=state, y=mean, color=state, fill=state, shape=state), size=1.5) + 
+  geom_hline(yintercept=ng0_R0_summary$mean, linetype="dashed", color="red") + 
+  scale_color_manual(breaks=state_order, values=c(rep("black", length(states)), "red"), guide="none") + 
+  scale_fill_manual(breaks=state_order, values=c(rep("black", length(states)), "red"), guide="none") + 
+  scale_shape_manual(breaks=state_order, values=c(rep(16, length(states)), 18), guide="none") + 
+  scale_y_continuous(limits=c(0, 8.2), breaks=seq(0, 8, 2)) + 
+  labs(y=expression(paste(R[0]))) + 
+  theme_bw() +
+  theme(axis.title.x=element_blank(), 
+        axis.text.x=element_text(size=8, angle=90, vjust=0.4, hjust=1, 
+                                 colour=c(rep("black", length(states)), "red")), 
+        axis.title.y=element_text(color="black", size=8), 
+        axis.text.y=element_text(colour="black", size=8)) + 
+  theme(plot.margin=unit(c(0.1, 0.1, 0.1, 0.2), "cm"), 
+        panel.grid.major.x=element_blank(), panel.grid.minor.y=element_blank(), 
+         panel.background=element_blank(), panel.border=element_blank(), 
+        axis.line.x.bottom = element_line(colour="black"), 
+        axis.line.y.left = element_line(colour="black"))
+print(state_R0_summary_plot)
+```
+
+```{r}
+color_scale <- rep(rev(brewer.pal(5, "RdYlBu")), each=10)
+state_R0_summary_map <- state_R0_summaries %>% 
+  filter(state!="Nigeria") %>% 
+  ggplot() + 
+  geom_sf(mapping=aes(geometry=geometry, fill=mean), color="black", size=0.3) + 
+ scale_fill_gradientn(colors=rep(rev(brewer.pal(5, "RdYlBu")), each=1), breaks=seq(2.5, 6.5, 1), limits=c(2.5, 6.5), 
+                       name=expression(paste("Mean ", R[0], sep=""))) +
+  theme_bw() + 
+  guides(fill=guide_colorbar(title.position="top", title.hjust=0.5, 
+                             ticks.colour="black", frame.colour="black")) + 
+  theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+        panel.background=element_blank(), panel.border=element_blank(), 
+        axis.line=element_blank(), axis.ticks=element_blank(), axis.text=element_blank(), 
+        axis.title=element_blank()) + 
+  theme(legend.position=c(0.9, 0.2), legend.key.size=unit(0.3, "cm"), legend.key.width=unit(0.5, "cm"), 
+        legend.text=element_text(size=8), legend.title=element_text(size=8), 
+        legend.box.background=element_blank(), legend.background=element_blank()) + 
+  theme(plot.margin=unit(c(0, 0, 0, 0), "cm"))
+print(state_R0_summary_map)
+```
+
+Let's create a map of the states in Nigeria. 
+
+```{r}
+zone_colors <- brewer.pal(9, "Set1")[c(1:5, 7)]
+zone_order <- c("North Central", "North East", "North West", "South East", "South South", "South West")
+mod_ng1 <- ng1 %>% 
+  left_join(ng1_zone_mapping, by="state") %>% 
+  mutate(x=st_coordinates(st_centroid(geometry))[,1], y=st_coordinates(st_centroid(geometry))[,2]) %>% 
+  mutate(state=ifelse(state=="Federal Capital Territory", "FCT", state))
+state_names <- unique(pull(mod_ng1, state))
+x_adj <- c(0.2, 0, 0.7, 0, 0, -0.8, 0, 0, 1.25, 0.1, 0.15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -0.35, 0, 0.45, 0, 0, 0, 0, 
+           0.1, 0, 0, 0, 0.2, 0, -0.15, 0, 0)
+y_adj <- c(0.2, 0.3, -0.55, 0, -0.5, -0.4, 0, 0, 0, -0.2, 0, -0.1, 0, 0.15, 0, 0, 0, 0, 0, 0, 0.2, 0, 0, -0.3, -0.3, 0, 0, 0, 
+           0.15, 0, 0, 0, -0.69, 0.2, 0, 0, 0)
+color <- c("white", "white", zone_colors[5], "white", "white", zone_colors[5], "white", "white", 
+           zone_colors[5], "white", "white", "white", "white", "white", "white", "white", "white", 
+           "white", "white", "white", "white", "white", "white", "white", zone_colors[6], "white", 
+           "white", "white", "white", "white", "white", "white", zone_colors[5], "white", "white", 
+           "white", "white")
+mod_ng1 %<>% 
+   left_join(data.frame(state=state_names, x_adj=x_adj, y_adj=y_adj, color=color), by="state")
+state_zone_map <- ggplot(data=mod_ng1) + 
+  geom_sf(mapping=aes(geometry=geometry, fill=zone), color="black", lwd=0.1) + 
+  geom_text(mapping=aes(x=x+x_adj, y=y+y_adj, label=state), size=2, color=color, fontface="bold") + 
+  scale_fill_manual(breaks=zone_order, values=zone_colors, name="") + 
+  theme_bw() + 
+  theme(legend.position="bottom", legend.box.just = "center", legend.margin = margin(6, 6, 6, 6)) + 
+  guides(fill=guide_legend(ncol=1)) + 
+  theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+        panel.background=element_blank(), panel.border=element_blank(), 
+        axis.line=element_blank(), axis.ticks=element_blank(), axis.text=element_blank(), 
+        axis.title=element_blank()) + 
+  theme(legend.position=c(0.85, 0.2), legend.key.size=unit(0.3, "cm"), legend.key.width=unit(0.3, "cm"), 
+        legend.text=element_text(size=9, color="black"), 
+        legend.box.background=element_blank(), legend.background=element_blank()) + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+print(state_zone_map)
+```
+
+Let's create a summary plot for the basic reproductive number. 
+
+```{r}
+pAB <- cowplot::plot_grid(state_zone_map, state_R0_summary_map, nrow=1, labels=c("A", "B"))
+pD <- cowplot::plot_grid(lambda_summary_plot, NULL, ncol=1, rel_heights=c(1, 0.7))
+pCD <- cowplot::plot_grid(state_R0_summary_plot, pD, nrow=1, rel_widths=c(1, 0.4), labels=c("C", "D"))
+pABCD <- cowplot::plot_grid(pAB, pCD, ncol=1)
+scale_factor <- 0.6
+pdf(file=file.path(FIGURES_FOLDER, "R0_estimation_summary_plot.pdf"), w=8.5, h=11*scale_factor)
+print(pABCD)
+a <- dev.off()
+```
+
+Let's create another potential summary plot for the basic reproductive number. 
+
+```{r}
+pAB <- cowplot::plot_grid(state_R0_summary_plot, state_R0_summary_map, nrow=1, labels=c("(a)", "(b)"), 
+                          rel_widths=c(1, 0.4), label_size=10, label_fontface="plain", label_fontfamily="serif")
+scale_factor <- 0.22
+pdf(file=file.path(FIGURES_FOLDER, "truncated_R0_estimation_summary_plot.pdf"), w=8.5, h=11*scale_factor)
+print(pAB)
+a <- dev.off()
+```
+
+Let's create a summary plot for the age-dependent risk of infection. 
+
+```{r}
+pBC <- cowplot::plot_grid(lambda_summary_plot, period_maternal_immunity, ncol=1, labels=c("(b)", "(c)"), 
+                          label_size=10, label_fontface = "plain", label_fontfamily="serif")
+pABC <- cowplot::plot_grid(mean_age_inf_plot, pBC, nrow=1, labels=c("(a)", ""), rel_widths=c(1, 0.45), 
+                           label_size=10, label_fontface = "plain", label_fontfamily="serif")
+
+scale_factor <- 0.3
+pdf(file=file.path(FIGURES_FOLDER, "age_dependent_risk_infection.pdf"), w=8.5, h=11*scale_factor)
+print(pABC)
+a <- dev.off()
+```
