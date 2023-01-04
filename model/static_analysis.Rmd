@@ -406,7 +406,7 @@ saveRDS(ng1_landscape_crs_incidence_list, file.path(SUMMARY_STATIC_SIMS_FOLDER, 
 saveRDS(ng1_landscape_births_list, file.path(SUMMARY_STATIC_SIMS_FOLDER, "ng1_landscape_births_series_list.rds"))
 ```
 
-Let's compute the 30-year CRS burden for each state under increasing levels of routine rubella vaccination coverage. 
+Let's compute the 30-year CRS burden for each state under increasing levels of routine rubella vaccination coverage. We also compute the CRS burden in the last 30-th year of each simtulation. 
 
 ```{r eval=FALSE}
 compute_crs_burden_distribution <- function(this_state, crs_incidence_list, births_list) {
@@ -415,16 +415,20 @@ compute_crs_burden_distribution <- function(this_state, crs_incidence_list, birt
   
   # compute the long-term CRS burden in each simulation
   crs_burdens <- rep(NA, ncol(state_crs_incidence)-1)
+  crs_burdens_lastyear <- rep(NA, ncol(state_crs_incidence)-1)
   for (ii in 1:(ncol(state_crs_incidence)-1)) {
     crs_incidence <- state_crs_incidence[, 1+ii]
     births <- state_births[, 2]
     crs_burdens[ii] <- sum(crs_incidence)/sum(births)*10^5
+    crs_burdens_lastyear[ii] <- sum(crs_incidence[(29*365+1):(30*365)])/sum(births[(29*365+1):(30*365)])*10^5
   }
   output <- data.frame(state=this_state, 
                        vac=as.numeric(colnames(state_crs_incidence[,-1])), 
-                       crs_burden=as.numeric(crs_burdens))
+                       crs_burden=as.numeric(crs_burdens), 
+                       crs_burden_lastyear=as.numeric(crs_burdens_lastyear))
   smoothed_crs_burden <- predict(loess(crs_burden~vac, data=output, span=0.12))
-  output %<>% mutate(smoothed_crs_burden)
+  smoothed_crs_burden_lastyear <- predict(loess(crs_burden_lastyear~vac, data=output, span=0.12))
+  output %<>% mutate(smoothed_crs_burden, smoothed_crs_burden_lastyear)
   return(output)
 }
 states <- c(sort(unique(pull(ng2_pop, state))), "Nigeria")
@@ -914,7 +918,7 @@ In this section, we estimate the minimum necessary coverage to prevent increases
 
 We start by plotting the minimum necessary coverage in each state on a geographical map of Nigeria. 
 
-```{r echo=FALSE, warning=FALSE}
+```{r warning=FALSE}
 plot_min_vac_cov_map <- function(min_vac_cov_data, ng1) {
   min_vac_cov_data <- min_vac_cov_data %>%
     filter(metric=="median") %>% 
@@ -949,7 +953,7 @@ Here, we plot a geographical map of the minimum routine vaccination coverage req
 
 ### Minimum coverage as function of birth rate and $R_0$
 
-```{r echo=FALSE}
+```{r}
 plot_min_cov_br_r0 <- function(min_vac_cov_data, ng1_cbr_data, ng1) {
   min_vac_cov_data %<>%
     filter(metric=="median") %>% 
@@ -978,7 +982,7 @@ Here, we plot the minimum coverage required to prevent long-term increases in CR
 
 Let's map out the states according to whether their current MCV1 coverage is above or below the minimum necessary RCV coverage required to prevent increases in long-term CRS burden. 
 
-```{r echo=FALSE, warning=FALSE}
+```{r warning=FALSE}
 plot_min_cov_mcv1_map <- function(min_vac_cov_data, ng1_mcv1_data, ng1) {
   min_vac_cov_data %<>%
     filter(metric=="median") %>% 
@@ -1149,5 +1153,75 @@ pABC <- cowplot::plot_grid(p1, p2, crs_burden_landscape, rel_widths=c(1, 1, 1.3)
 scale_factor <- 0.2
 pdf(file=file.path(FIGURES_FOLDER, "min_vac_cov_plot.pdf"), w=8.5, h=11*scale_factor)
 print(pABC)
+a <- dev.off()
+```
+
+Let's also show the minimum routine vaccination coverage required to eliminate CRS cases after 30 years of vaccination. 
+
+```{r warning=FALSE}
+plot_min_elim_vac_cov <- function(crs_burden_dist, min_vac_cov, ng1) {
+  summarised_crs_burden_dist <- crs_burden_dist %>%
+    filter(smoothed_crs_burden_lastyear<1) %>% 
+    mutate(vac=as.numeric(as.character(vac))) %>% 
+    group_by(state) %>% 
+    filter(vac==min(vac)) %>%
+    right_join(unique(select(crs_burden_dist, state)), by="state") %>% 
+    left_join(filter(min_vac_cov, metric=="median"), by="state") %>% 
+    left_join(ng1, by="state") %>%
+    mutate(zone=ifelse(state=="Nigeria", "National", zone))
+  
+  cb <- rev(RColorBrewer::brewer.pal(9, "RdPu"))
+  color_generator <- colorRampPalette(cb)
+  pal <- rev(color_generator(10))
+  
+  min_elim_vac_cov_map <- ggplot() + 
+    geom_sf(data=filter(summarised_crs_burden_dist, state!="Nigeria"), 
+            aes(geometry=geometry, fill=vac)) + 
+    scale_fill_gradientn(breaks=seq(0, 100, 20), limits=c(0, 100), colors=rep(pal, each=10), 
+                         labels=paste(seq(0, 100, 20), "%", sep=""), name="Necessary\ncoverage", 
+                         guide=guide_colorbar(frame.colour="black", ticks.colour="black", title.position="top")) + 
+    theme_bw() + 
+    theme(legend.position=c(0.85, 0.2), legend.key.size=unit(0.5, "cm"), legend.key.width=unit(0.6, "cm"), 
+          legend.key.height=unit(0.4, "cm"), 
+          legend.text=element_text(size=8), legend.title=element_text(size=8), 
+          legend.box.background=element_blank(), legend.background=element_blank()) + 
+    theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+          panel.background=element_blank(), panel.border=element_blank(), 
+          axis.title = element_blank(), axis.line=element_blank(), axis.ticks=element_blank(), 
+          axis.text=element_blank()) + 
+    theme(plot.margin = unit(c(0.05, 0.3, 0.05, 0.05), "cm"))
+  
+  zone_colors <- c(brewer.pal(9, "Set1")[c(1:5, 7)], "grey")
+  zone_order <- c("North Central", "North East", "North West", 
+                  "South East", "South South", "South West", "National")
+  min_vac_cov_comparison <- ggplot(data=summarised_crs_burden_dist) + 
+    geom_point(mapping=aes(x=min_cov*100, y=vac, color=zone)) + 
+    scale_x_continuous(limits=c(0, 100), breaks=seq(0, 100, 25), labels=paste0(seq(0, 100, 25), "%")) + 
+    scale_y_continuous(limits=c(0, 100), breaks=seq(0, 100, 25), labels=paste0(seq(0, 100, 25), "%")) + 
+    scale_color_manual(breaks=zone_order, values=zone_colors) + 
+    labs(x="Routine coverage necessary for safe introduction (%)", 
+         y="Routine coverage necessary for elimination (%)") + 
+    theme_bw() + 
+    theme(legend.position = c(0.8, 0.5), legend.key.size=unit(0.3, "cm"), 
+          legend.title=element_blank(), legend.background=element_rect(color="black")) + 
+    theme(axis.text=element_text(size=8, color="black"), 
+          axis.title=element_text(size=8, color="black"), 
+          legend.text=element_text(size=8, color="black")) + 
+    theme(plot.margin=unit(c(0.5, 0.5, 0.5, 0.5), "cm"), 
+          panel.grid=element_blank(), 
+          panel.background=element_blank(), panel.border=element_blank(), 
+          axis.line.x.bottom = element_line(colour="black"), 
+          axis.line.y.left = element_line(colour="black"))
+  
+  pAB <- cowplot::plot_grid(min_elim_vac_cov_map, min_vac_cov_comparison, nrow=1, 
+                            labels=c("(a)", "(b)"), label_size=10, label_fontface="plain", label_fontfamily="serif")
+  return(pAB)
+}
+min_elim_vac_cov <- plot_min_elim_vac_cov(crs_burden_dist=state_landscape_crs_burden_dist, 
+                                          min_vac_cov=min_vac_cov_data, 
+                                          ng1=ng1)
+scale_factor <- 0.3
+pdf(file=file.path(FIGURES_FOLDER, "min_elim_vac_cov.pdf"), w=8.5, h=11*scale_factor)
+print(min_elim_vac_cov)
 a <- dev.off()
 ```
